@@ -20,6 +20,8 @@ Requirements:
 
 Note: Both URL formats are supported. Microsoft is retiring legacy
 Office 365 Connectors by March 2026 - migrate to Workflows.
+
+Compatible with: Bugsink 2.1.x+
 """
 
 import json
@@ -33,6 +35,8 @@ from bugsink.app_settings import get_settings
 from bugsink.transaction import immediate_atomic
 
 from issues.models import Issue
+from .base import BaseWebhookBackend
+from .webhook_security import validate_webhook_url
 
 
 class MicrosoftTeamsConfigForm(forms.Form):
@@ -75,6 +79,14 @@ class MicrosoftTeamsConfigForm(forms.Form):
             self.fields["channel_name"].initial = config.get("channel_name", "")
             self.fields["mention_users"].initial = ",".join(config.get("mention_users", []))
             self.fields["title_color"].initial = config.get("title_color", "attention")
+
+    def clean_webhook_url(self):
+        webhook_url = self.cleaned_data["webhook_url"]
+        try:
+            validate_webhook_url(webhook_url)
+        except ValueError as e:
+            raise forms.ValidationError(str(e)) from e
+        return webhook_url
 
     def get_config(self):
         return {
@@ -237,11 +249,10 @@ def microsoft_teams_send_test_message(webhook_url, channel_name, mention_users, 
     )
 
     try:
-        result = requests.post(
+        result = MicrosoftTeamsBackend.safe_post(
             webhook_url,
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
-            timeout=5,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)
@@ -287,11 +298,10 @@ def microsoft_teams_send_alert(webhook_url, channel_name, mention_users, title_c
     )
 
     try:
-        result = requests.post(
+        result = MicrosoftTeamsBackend.safe_post(
             webhook_url,
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
-            timeout=5,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)
@@ -304,7 +314,7 @@ def microsoft_teams_send_alert(webhook_url, channel_name, mention_users, title_c
         _store_failure_info(service_config_id, e)
 
 
-class MicrosoftTeamsBackend:
+class MicrosoftTeamsBackend(BaseWebhookBackend):
     """Backend class for Microsoft Teams integration."""
 
     def __init__(self, service_config):

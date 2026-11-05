@@ -20,6 +20,8 @@ Setup (Fine-grained Token - Recommended):
     3. Select the repository
     4. Under "Repository permissions", set "Issues" to "Read and write"
     5. Generate and copy the token
+
+Compatible with: Bugsink 2.1.x+
 """
 
 import json
@@ -33,6 +35,7 @@ from bugsink.app_settings import get_settings
 from bugsink.transaction import immediate_atomic
 
 from issues.models import Issue
+from .webhook_security import validate_webhook_url
 
 
 GITHUB_API_URL = "https://api.github.com"
@@ -150,6 +153,7 @@ def github_issues_send_test_message(repository, access_token, labels, assignees,
                                      project_name, display_name, service_config_id):
     """Send a test issue to verify GitHub configuration."""
     url = f"{GITHUB_API_URL}/repos/{repository}/issues"
+    validate_webhook_url(url)
 
     payload = {
         "title": f"[Bugsink] Test Issue - {project_name}"[:256],
@@ -181,6 +185,7 @@ def github_issues_send_test_message(repository, access_token, labels, assignees,
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=5,
+            allow_redirects=False,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)
@@ -230,6 +235,7 @@ def github_issues_send_alert(repository, access_token, labels, assignees,
     body += "\n---\n*This issue was automatically created by [Bugsink](https://bugsink.com)*"
 
     url = f"{GITHUB_API_URL}/repos/{repository}/issues"
+    validate_webhook_url(url)
 
     payload = {
         "title": title[:256],
@@ -252,6 +258,7 @@ def github_issues_send_alert(repository, access_token, labels, assignees,
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=5,
+            allow_redirects=False,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)
