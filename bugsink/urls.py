@@ -17,14 +17,16 @@ from users.views import (
 from ingest.views import download_envelope
 from files.views import chunk_upload, artifact_bundle_assemble, difs_assemble, api_root, api_catch_all
 from bugsink.decorators import login_exempt
+from bugsink.permissions import IsAuthTokenAuthenticated
 
 from events.api_views import EventViewSet
-from issues.api_views import IssueCommentViewSet, IssueViewSet
+from issues.api_views import IssueCommentViewSet, IssueHistoryViewSet, IssueViewSet
 from projects.api_views import ProjectViewSet
 from releases.api_views import ReleaseViewSet
 from teams.api_views import TeamViewSet
 
 from .views import home, trigger_error, favicon, settings_view, silence_email_system_warning, counts, health_check_ready
+from .views import silence_remote_message
 from .debug_views import csrf_debug
 
 
@@ -33,9 +35,15 @@ admin.site.site_title = get_settings().SITE_TITLE
 admin.site.index_title = "Admin"  # everyone calls this the "admin" anyway. Let's set the title accordingly.
 
 
+class CanonicalAPIRootView(routers.APIRootView):
+    permission_classes = [IsAuthTokenAuthenticated]
+
+
 api_router = routers.DefaultRouter()
+api_router.APIRootView = CanonicalAPIRootView
 api_router.register(r'events', EventViewSet)
 api_router.register(r'issue-comments', IssueCommentViewSet, basename='issue-comment')
+api_router.register(r'issue-history', IssueHistoryViewSet, basename='issue-history')
 api_router.register(r'issues', IssueViewSet)
 api_router.register(r'projects', ProjectViewSet)
 api_router.register(r'releases', ReleaseViewSet)
@@ -106,6 +114,11 @@ urlpatterns += [
     path('admin/', admin.site.urls),
 
     path('silence-email-system-warning/', silence_email_system_warning, name='silence_email_system_warning'),
+    path(
+        'silence-remote-message/<slug:message_id>/',
+        silence_remote_message,
+        name='silence_remote_message',
+    ),
     path('settings/', settings_view, name='settings'),
     path('counts/', counts, name='counts'),
     path('debug/csrf/', csrf_debug, name='csrf_debug'),

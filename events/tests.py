@@ -23,11 +23,75 @@ from .retention import (
 from .sparklines import (
     get_issue_event_sparkline, get_issue_list_event_sparklines, get_sparkline_range, get_y_labels)
 from .usage import EVENT_COUNTS_PER_HOUR_MAX_AGE, hour_bucket, record_event_counts
-from .utils import annotate_with_meta, annotate_var_with_meta
+from .utils import annotate_with_meta, annotate_var_with_meta, get_stacktrace_entries, get_sources_content
 from tags.models import EventTag, store_tags
 from tags.search import search_events
 
 User = get_user_model()
+
+
+class StacktraceEntriesTestCase(RegularTestCase):
+    def test_thread_stacktrace_entry_contains_thread_fields(self):
+        stacktrace = {"frames": [{"filename": "worker.py"}]}
+
+        entries = get_stacktrace_entries({
+            "threads": {"values": [{
+                "id": 7,
+                "name": "worker",
+                "crashed": False,
+                "state": "waiting",
+                "stacktrace": stacktrace,
+            }]},
+        })
+
+        self.assertEqual([{
+            "stacktrace": stacktrace,
+            "is_exception_stacktrace": False,
+            "thread_title": "Thread #7: worker",
+            "thread_description": "errored: no, state: Waiting",
+        }], entries)
+
+    def test_top_level_stacktrace_is_used_as_last_fallback(self):
+        stacktrace = {"frames": [{"filename": "scheduler.php", "lineno": 176}]}
+
+        entries = get_stacktrace_entries({
+            "logentry": {"formatted": "Scheduler task failed"},
+            "stacktrace": stacktrace,
+        })
+
+        self.assertEqual([{
+            "stacktrace": stacktrace,
+            "is_exception_stacktrace": False,
+        }], entries)
+
+    def test_thread_stacktrace_takes_precedence_over_top_level_stacktrace(self):
+        thread_stacktrace = {"frames": [{"filename": "thread.php"}]}
+
+        entries = get_stacktrace_entries({
+            "logentry": {"formatted": "Scheduler task failed"},
+            "threads": {"values": [{"stacktrace": thread_stacktrace}]},
+            "stacktrace": {"frames": [{"filename": "deprecated.php"}]},
+        })
+
+        self.assertEqual(thread_stacktrace, entries[0]["stacktrace"])
+
+
+class SourcesContentTestCase(RegularTestCase):
+    def test_regular_map(self):
+        self.assertEqual({"a.ts": ["a1", "a2"]}, get_sources_content({
+            "sources": ["a.ts", "b.ts"],
+            "sourcesContent": ["a1\na2", None],
+        }))
+
+    def test_index_map(self):
+        self.assertEqual({"a.ts": ["a1"], "b.ts": ["b1"]}, get_sources_content({
+            "sources": [],
+            "sections": [
+                {"offset": {"line": 0, "column": 0}, "map": {"sources": ["a.ts"], "sourcesContent": ["a1"]}},
+                {"offset": {"line": 5, "column": 0}, "map": {"sources": ["b.ts"], "sourcesContent": ["b1"]}},
+                {"offset": {"line": 9, "column": 0}, "map": {"sources": ["a.ts"], "sourcesContent": [None]}},
+            ],
+        }))
 
 
 class ViewTests(TransactionTestCase):
@@ -54,17 +118,12 @@ class ViewTests(TransactionTestCase):
         self.assertEqual(response['Content-Type'], 'application/json')
         self.assertTrue("platform" in response.json())
 
-    def test_event_plaintext(self):
-        response = self.client.get(f"/events/event/{self.event.pk}/plain/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response['Content-Type'], 'text/plain')
-
     def test_event_views_forbid_events_from_other_projects(self):
         other_project = Project.objects.create(name="other")
         other_issue, _ = get_or_create_issue(project=other_project)
         other_event = create_event(other_project, other_issue)
 
-        for suffix in ["download/", "raw/", "plain/", "md/"]:
+        for suffix in ["download/", "raw/", "md/"]:
             with self.subTest(suffix=suffix):
                 response = self.client.get(f"/events/event/{other_event.pk}/{suffix}")
                 self.assertEqual(response.status_code, 403)

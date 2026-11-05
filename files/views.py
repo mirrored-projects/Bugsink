@@ -3,23 +3,27 @@ from hashlib import sha1
 from gzip import GzipFile
 from io import BytesIO
 import logging
+from uuid import UUID
 
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import user_passes_test
 from django.http import Http404
+from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from sentry.assemble import ChunkFileState
 
 from bugsink.app_settings import get_settings
-from bugsink.transaction import durable_atomic, immediate_atomic
+from bugsink.api_capabilities import required_capability
+from bugsink.api_authorization import enforce_project_boundness, enforce_user_boundness_for_project
+from bugsink.authentication import get_token_for_authentication
+from bugsink.transaction import durable_atomic, immediate_atomic, delay_on_commit
 from bugsink.streams import handle_request_content_encoding, copy_stream_limited, MaxLengthExceeded
-from bsmain.models import AuthToken
 from projects.models import Project
 
-from .models import Chunk, File, FileMetadata
-from .tasks import assemble_artifact_bundle, assemble_file
-from .minidump import extract_dif_metadata
+from .models import ArtifactBundleAssembly, Chunk, DifAssembly, File
+from .tasks import assemble_artifact_bundle, assemble_dif, create_chunk
 
 logger = logging.getLogger("bugsink.api")
 
@@ -114,30 +118,45 @@ def get_chunk_upload_settings(request, organization_slug):
     })
 
 
-def requires_auth_token(view_function):
-    # {"error": "..."} (status=401) response is API-compatible; for that to work we need the present function to be a
-    # decorator (so we can return, rather than raise, which plain-Django doesn't support for 401)
+def requires_auth_token(capability, methods):
+    """Require an API token with the given capability for the declared HTTP methods."""
 
-    def first_require_auth_token(request, *args, **kwargs):
-        header_value = request.META.get("HTTP_AUTHORIZATION")
-        if not header_value:
-            return JsonResponse({"error": "Authorization header not found"}, status=401)
+    def decorator(view_function):
+        # Returning {"error": "..."} with status 401 preserves the existing API response shape; plain Django has no
+        # authentication exception which produces that response for us.
+        def first_require_auth_token(request, *args, **kwargs):
+            header_value = request.META.get("HTTP_AUTHORIZATION")
+            if not header_value:
+                return JsonResponse({"error": "Authorization header not found"}, status=401)
 
-        header_values = header_value.split()
+            header_values = header_value.split()
 
-        if len(header_values) != 2:
-            return JsonResponse(
-                {"error": "Expecting 'Authorization: Token abc123...' but got '%s'" % header_value}, status=401)
+            if len(header_values) != 2:
+                return JsonResponse(
+                    {"error": "Expecting 'Authorization: Bearer abc123...' but got '%s'" % header_value}, status=401)
 
-        the_word_bearer, token = header_values
+            the_word_bearer, token = header_values
 
-        if AuthToken.objects.filter(token=token).count() < 1:
-            return JsonResponse({"error": "Invalid token"}, status=401)
+            token = get_token_for_authentication(token)
+            if token is None:
+                return JsonResponse({"error": "Invalid token"}, status=401)
+            if capability not in token.capabilities:
+                return JsonResponse(
+                    {"error": "This token does not have the required capability: %s." % capability}, status=403)
 
-        return view_function(request, *args, **kwargs)
+            # Resource-specific user-bound checks are the responsibility of the view, which receives the token here.
+            request.auth_token = token
+            try:
+                return view_function(request, *args, **kwargs)
+            except PermissionDenied as error:
+                return JsonResponse({"error": error.detail}, status=403)
 
-    first_require_auth_token.__name__ = view_function.__name__
-    return first_require_auth_token
+        first_require_auth_token.__name__ = view_function.__name__
+        view = required_capability(capability, methods=methods)(first_require_auth_token)
+        view._required_capability_enforcer = requires_auth_token  # used in tests only
+        return view
+
+    return decorator
 
 
 def get_artifact_bundle_projects(data):
@@ -157,11 +176,29 @@ def get_artifact_bundle_projects(data):
     return [projects_by_slug[slug] for slug in dict.fromkeys(project_slugs)], None
 
 
+def get_and_renew_available_chunk_checksums(checksums):
+    now = timezone.now()
+
+    with immediate_atomic():
+        chunks = Chunk.objects.filter(checksum__in=checksums)
+        available_checksums = set(chunks.values_list("checksum", flat=True))
+        chunks.update(created_at=now)  # mis-abuse created_at as updated_at to avoid adding a field for little gain
+
+    return available_checksums
+
+
 @csrf_exempt
-@requires_auth_token
+@requires_auth_token("debug-files:upload", methods=["GET", "POST"])
 def chunk_upload(request, organization_slug):
     # Bugsink has a single-organization model; we simply ignore organization_slug
+    # Chunks are projectless until assembly, so project boundness is enforced only when a project is supplied there.
     # NOTE: we don't check against chunkSize, maxRequestSize and chunksPerRequest (yet), we expect the CLI to behave.
+    if request.auth_token.is_user_bound and request.auth_token.is_project_bound:
+        enforce_user_boundness_for_project(
+            request.auth_token,
+            "debug-files:upload",
+            request.auth_token.project,
+        )
 
     if request.method == "GET":
         # a GET at this endpoint returns a dict of settings that the CLI takes into account when uploading
@@ -185,15 +222,7 @@ def chunk_upload(request, organization_slug):
             if sha1(data, usedforsecurity=False).hexdigest() != chunk.name:
                 raise Exception("checksum mismatch")
 
-            # a snug fit around the only DB-writing thing we do here to ensure minimal blocking
-            with immediate_atomic():
-                _, _ = Chunk.objects.get_or_create(
-                    checksum=chunk.name,
-                    defaults={
-                        "size": len(data),
-                        # NOTE: further possible optimization: don't even read the file when already existing
-                        "data": data,
-                    })
+            create_chunk(chunk.name, data)
 
         for chunk in request.FILES.getlist("file_gzip"):
             output_stream = BytesIO()
@@ -209,15 +238,7 @@ def chunk_upload(request, organization_slug):
             if sha1(data, usedforsecurity=False).hexdigest() != chunk.name:
                 raise Exception("checksum mismatch")
 
-            # a snug fit around the only DB-writing thing we do here to ensure minimal blocking
-            with immediate_atomic():
-                _, _ = Chunk.objects.get_or_create(
-                    checksum=chunk.name,
-                    defaults={
-                        "size": len(data),
-                        # NOTE: further possible optimization: don't even read the file when already existing
-                        "data": data,
-                    })
+            create_chunk(chunk.name, data)
     except MaxLengthExceeded as e:
         return JsonResponse({"error": str(e)}, status=413)
 
@@ -225,7 +246,7 @@ def chunk_upload(request, organization_slug):
 
 
 @csrf_exempt  # we're in API context here; this could potentially be pulled up to a higher level though
-@requires_auth_token
+@requires_auth_token("debug-files:upload", methods=["POST"])
 def artifact_bundle_assemble(request, organization_slug):
     # Bugsink has a single-organization model; we simply ignore organization_slug
 
@@ -241,25 +262,51 @@ def artifact_bundle_assemble(request, organization_slug):
         logger.warning("Rejected artifact bundle: project slug is missing or does not match an existing project.")
         return JsonResponse({"error": error}, status=400)
 
+    for project in projects:
+        enforce_project_boundness(request.auth_token, project)
+        enforce_user_boundness_for_project(request.auth_token, "debug-files:upload", project)
+
     # sentry-cli >= 3.x calls this endpoint before uploading chunks (to learn which ones are missing), then uploads
     # only the missing chunks, and then polls this endpoint again. We must return the actual missing chunks; returning
     # an empty list causes sentry-cli 3.x to skip uploading, and the subsequent assembly fails with a KeyError.
 
-    available_checksums = set(
-        Chunk.objects.filter(checksum__in=chunk_checksums).values_list("checksum", flat=True)
-    )
+    available_checksums = get_and_renew_available_chunk_checksums(chunk_checksums)
     missing_chunks = [c for c in chunk_checksums if c not in available_checksums]
     if missing_chunks:
         return JsonResponse({"state": ChunkFileState.NOT_FOUND, "missingChunks": missing_chunks})
 
-    assemble_artifact_bundle.delay(checksum, chunk_checksums, [project.id for project in projects])
-    # In the ALWAYS_EAGER setup, we process the bundle inline, so arguably we could return "OK" here too; "CREATED" is
-    # what sentry returns though, so for faithful mimicking it's the safest bet.
-    return JsonResponse({"state": ChunkFileState.CREATED, "missingChunks": []})
+    with immediate_atomic():
+        assemblies = []
+        new_project_ids = []
+        for project in projects:
+            assembly, created = ArtifactBundleAssembly.objects.get_or_create(
+                project=project,
+                checksum=checksum,
+            )
+            assemblies.append(assembly)
+            if created:
+                new_project_ids.append(project.id)
+
+        if new_project_ids:
+            delay_on_commit(assemble_artifact_bundle, checksum, chunk_checksums, new_project_ids)
+
+    if any(assembly.state == ChunkFileState.ERROR for assembly in assemblies):
+        assembly = next(assembly for assembly in assemblies if assembly.state == ChunkFileState.ERROR)
+    elif any(assembly.state == ChunkFileState.CREATED for assembly in assemblies):
+        assembly = next(assembly for assembly in assemblies if assembly.state == ChunkFileState.CREATED)
+    elif any(assembly.state == ChunkFileState.ASSEMBLING for assembly in assemblies):
+        assembly = next(assembly for assembly in assemblies if assembly.state == ChunkFileState.ASSEMBLING)
+    else:
+        assembly = assemblies[0]
+
+    response = {"state": assembly.state, "missingChunks": []}
+    if assembly.detail:
+        response["detail"] = assembly.detail
+    return JsonResponse(response)
 
 
 @csrf_exempt  # we're in API context here; this could potentially be pulled up to a higher level though
-@requires_auth_token
+@requires_auth_token("debug-files:upload", methods=["POST"])
 def difs_assemble(request, organization_slug, project_slug):
     if not get_settings().FEATURE_MINIDUMPS:
         return JsonResponse({"detail": "minidumps not enabled"}, status=404)
@@ -267,16 +314,26 @@ def difs_assemble(request, organization_slug, project_slug):
     project = Project.objects.filter(slug=project_slug, is_deleted=False).first()
     if project is None:
         return JsonResponse({"detail": "Project not found: %s" % project_slug}, status=404)
+    enforce_project_boundness(request.auth_token, project)
+    enforce_user_boundness_for_project(request.auth_token, "debug-files:upload", project)
 
-    # TODO move to tasks.something.delay
-    # TODO think about the right transaction around this
     data = json.loads(request.body)
+    try:
+        # TODO : .get implies "no debug_id", but in that case it's useless
+        debug_ids = {
+            checksum: UUID(info["debug_id"]) if info.get("debug_id") is not None else None
+            for checksum, info in data.items()
+        }
+    except (ValueError, TypeError, AttributeError):
+        return JsonResponse({"detail": "Invalid debug ID"}, status=400)
 
     file_checksums = set(data.keys())
 
-    existing_files = {
-        file.checksum: file
-        for file in File.objects.filter(checksum__in=file_checksums)
+    # Use values_list("checksum") so this existence check doesn't load File.data into memory.
+    existing_files = set(File.objects.filter(checksum__in=file_checksums).values_list("checksum", flat=True))
+    assemblies = {
+        (assembly.checksum, assembly.debug_id): assembly
+        for assembly in DifAssembly.objects.filter(project=project, checksum__in=file_checksums)
     }
 
     all_requested_chunks = {
@@ -285,17 +342,16 @@ def difs_assemble(request, organization_slug, project_slug):
         for chunk in file_info.get("chunks", [])
     }
 
-    available_chunks = set(
-        Chunk.objects.filter(checksum__in=all_requested_chunks).values_list("checksum", flat=True)
-    )
+    available_chunks = get_and_renew_available_chunk_checksums(all_requested_chunks)
 
     response = {}
 
     for file_checksum, file_info in data.items():
-        if file_checksum in existing_files:
-            file = existing_files[file_checksum]
-        else:
-            file_chunks = file_info.get("chunks", [])
+        debug_id = debug_ids[file_checksum]
+        assembly = assemblies.get((file_checksum, debug_id))
+        file_chunks = file_info.get("chunks", [])
+
+        if assembly is None and file_checksum not in existing_files:
 
             # the sentry-cli sends an empty "chunks" list when just polling for file existence; since we already handled
             # the case of existing files above, we can simply return NOT_FOUND here.
@@ -314,24 +370,19 @@ def difs_assemble(request, organization_slug, project_slug):
                 }
                 continue
 
-            file, _ = assemble_file(file_checksum, file_chunks, filename=file_info["name"])
-
-        symbolic_metadata = extract_dif_metadata(file.get_raw_data())
-
-        FileMetadata.objects.get_or_create(
-            project=project,
-            debug_id=file_info.get("debug_id"),  # TODO : .get implies "no debug_id", but in that case it's useless
-            file_type=symbolic_metadata["kind"],  # NOTE: symbolic's kind goes into file_type...
-            defaults={
-                "file": file,
-                "data": "{}",  # this is the "catch all" field but I don't think we have anything in this case.
-            }
-        )
+        if assembly is None:
+            with immediate_atomic():
+                assembly, created = DifAssembly.objects.get_or_create(
+                    project=project, checksum=file_checksum, debug_id=debug_id)
+                if created:
+                    delay_on_commit(assemble_dif, assembly.pk, file_chunks, file_info["name"])
 
         response[file_checksum] = {
-            "state": ChunkFileState.OK,
+            "state": assembly.state,
             "missingChunks": [],
         }
+        if assembly.detail:
+            response[file_checksum]["detail"] = assembly.detail
 
     return JsonResponse(response)
 
@@ -383,10 +434,13 @@ def api_catch_all(request, subpath):
 
     content_type = request.META.get("CONTENT_TYPE", "")
     if content_type == "application/x-www-form-urlencoded" or content_type.startswith("multipart/form-data"):
-        if request.POST:
-            lines.append(f"  POST:   {request.POST.dict()}")
-        if request.FILES:
-            lines.append(f"  FILES:  {[f.name for f in request.FILES.values()]}")
+        try:
+            if request.POST:
+                lines.append(f"  POST:   {request.POST.dict()}")
+            if request.FILES:
+                lines.append(f"  FILES:  {[f.name for f in request.FILES.values()]}")
+        except MaxLengthExceeded as e:
+            return JsonResponse({"detail": str(e)}, status=413)
 
     else:
         shown_pretty = False
@@ -412,7 +466,7 @@ def api_catch_all(request, subpath):
 
 
 @csrf_exempt
-@requires_auth_token
+@requires_auth_token("debug-files:upload", methods=["GET"])
 def api_root(request):
     # the results of this endpoint mimick what Sentry does for the GET on the /api/0/ path; we simply did a request on
     # their endpoint and hardcoded the result below.

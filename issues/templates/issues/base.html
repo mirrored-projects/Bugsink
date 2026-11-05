@@ -4,6 +4,7 @@
 {% load humanize %}
 {% load stricter_templates %}
 {% load add_to_qs %}
+{% load tag_search %}
 {% load i18n %}
 
 {% block title %}{{ issue.title }} · {{ block.super }}{% endblock %}
@@ -88,10 +89,14 @@
     </div> {# top, RHS (buttons) #}
 
     <div class="overflow-hidden"><!-- top, LHS (various texts) -->
+        {% if issue.is_log_message %}
+        <h1 class="text-4xl font-bold text-ellipsis whitespace-nowrap overflow-hidden pb-1 {# needed for descenders of 'g' #}">{{ issue.title }}</h1>
+        {% else %}
         <h1 class="text-4xl font-bold text-ellipsis whitespace-nowrap overflow-hidden pb-1 {# needed for descenders of 'g' #}">{{ issue.calculated_type }}</h1>
         <div class="text-xl text-ellipsis whitespace-nowrap overflow-hidden">{{ issue.calculated_value }}</div>
+        {% endif %}
         {% if request_repr %}<div class="italic mt-4">{{ request_repr }}</div>{% endif %}
-        <div class="text-ellipsis whitespace-nowrap overflow-hidden"><span class="font-bold">{% if issue.last_frame_module %}{{ issue.last_frame_module}}{% else %}{{ issue.last_frame_filename }}{% endif %}</span>{% if issue.last_frame_function %} in <span class="font-bold">{{ issue.last_frame_function }}</span>{% endif %}</div>
+        <div class="text-ellipsis whitespace-nowrap overflow-hidden"><span class="font-bold">{% if issue.last_frame_module %}{{ issue.last_frame_module}}{% else %}{{ issue.last_frame_filename }}{% endif %}</span>{% if issue.last_frame_function %} in <span class="font-bold">{{ issue.last_frame_function }}</span>{% endif %}{% if issue.is_log_message and event.level %}{% if issue.last_frame_module or issue.last_frame_filename or issue.last_frame_function %} | {% endif %}<span class="font-bold">{{ event.level|upper }}</span>{% endif %}</div>
     </div> {# top, LHS (various texts) #}
 
 </div>
@@ -122,7 +127,6 @@
                 <a href="{{ script_prefix }}/events/event/{{ event.id }}/download/">{% translate "Download" %}</a>
                 | <a href="{{ script_prefix }}/events/event/{{ event.id }}/raw/" >{% translate "JSON" %}</a>
                 | <a href="{{ script_prefix }}/events/event/{{ event.id }}/md/" >{% translate "Markdown" %}</a>
-                | <a href="{{ script_prefix }}/events/event/{{ event.id }}/plain/" >{% translate "Plain" %}</a>
                 {% endif %}
 
                 {% if app_settings.USE_ADMIN and user.is_staff %}
@@ -234,14 +238,12 @@
             </div>
             <div class="p-4">
                 {% for issuetags in issue.tags_summary %}
-                    <a href="{{ script_prefix }}/issues/issue/{{ issue.id }}/tags/{% current_qs %}" class="block mb-4">
+                    <div class="mb-4">
                         <div class="text-sm font-bold text-slate-500 dark:text-slate-300">{{ issuetags.0.key.key }}:</div>
                         <div>
-                        {% for issuetag in issuetags %}
-                            <span>{{ issuetag.value.value }} <span class="text-xs">({{ issuetag.pct }}%)</span>{% if not forloop.last %}</span>,{% endif %}
-                        {% endfor %}
+                        {% for issuetag in issuetags %}{% if issuetag.is_other %}{{ issuetag.value.value }}{% else %}<a href="{% url 'issue_list_open' project_pk=issue.project_id %}?q={% tag_drilldown request.GET.q issuetags.0.key.key issuetag.value.value %}" class="hover:text-cyan-500 dark:hover:text-cyan-300" title="Filter issues by this tag">{{ issuetag.value.value }}</a>{% endif %} <span class="text-xs">({{ issuetag.pct }}%)</span>{% if not forloop.last %}, {% endif %}{% endfor %}
                         </div>
-                    </a>
+                    </div>
                 {% endfor %}
 
                 <div class="text-sm font-bold italic text-slate-500 dark:text-slate-300"><a href="{{ script_prefix }}/issues/issue/{{ issue.id }}/tags/{% current_qs %}">{% translate "All tags..." %}</a></div>

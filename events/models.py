@@ -10,7 +10,7 @@ from projects.models import Project
 from compat.timestamp import parse_timestamp
 from bugsink.transaction import delay_on_commit
 
-from issues.utils import get_title_for_exception_type_and_value
+from issues.utils import get_title_for_exception_type_and_value, LOG_MESSAGE_TYPE
 
 from .retention import get_random_irrelevance
 from .storage_registry import get_write_storage, get_storage
@@ -202,11 +202,15 @@ class Event(models.Model):
     def title(self):
         return get_title_for_exception_type_and_value(self.calculated_type, self.calculated_value)
 
+    def is_log_message(self):
+        # Ingest derives calculated_type from this event's payload.
+        return self.calculated_type == LOG_MESSAGE_TYPE
+
     @classmethod
     def from_ingested(cls, event_metadata, digested_at, digest_order, project_digest_order, stored_event_count, issue,
                       grouping, parsed_data, denormalized_fields):
 
-        # 'from_ingested' may be a bit of a misnomer... the full 'from_ingested' is done in 'digest_event' in the views.
+        # 'from_ingested' may be a bit of a misnomer... the full 'from_ingested' is done in 'digest_event' in tasks.
         # below at least puts the parsed_data in the right place, and does some of the basic object set up (FKs to other
         # objects etc).
 
@@ -229,7 +233,7 @@ class Event(models.Model):
                 storage_backend=None if write_storage is None else write_storage.name,
 
                 timestamp=parse_timestamp(parsed_data.get("timestamp", event_metadata["ingested_at"])),
-                platform=parsed_data["platform"][:64],
+                platform=(parsed_data.get("platform") or "other")[:64],
 
                 level=maybe_empty(parsed_data.get("level", "")),
                 logger=maybe_empty(parsed_data.get("logger", ""))[:64],

@@ -9,6 +9,7 @@ from rest_framework.test import APIClient
 
 from bsmain.models import AuthToken
 from bugsink.test_utils import TransactionTestCase25251 as TransactionTestCase
+from issues.utils import get_denormalized_fields_for_data, get_type_and_value_for_data, maybe_empty
 from projects.models import Project, ProjectMembership
 
 from .factories import create_event
@@ -40,6 +41,7 @@ THREAD_STACKTRACE_SAMPLES = [
 
 JAVA_MULTIPLE_THREADS_SAMPLE = "sentry-java-capture-message-attach-threads.json"
 JAVA_MULTIPLE_THREADS_MESSAGE = "capture_message with all Java threads from ProbeMultipleThreads.java"
+JAVA_EXCEPTION_THREADS_SAMPLE = "sentry-java-capture-exception-attach-threads.json"
 
 
 def load_generated_sample(filename):
@@ -56,8 +58,27 @@ class ThreadStacktraceSampleTests(TransactionTestCase):
         ProjectMembership.objects.create(project=self.project, user=self.user, accepted=True)
         self.client.force_login(self.user)
         self.api_client = APIClient()
-        token = AuthToken.objects.create()
+        token = AuthToken.objects.create(events_read=True)
         self.api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {token.token}")
+
+    def create_event_from_sample(self, data):
+        # create_event bypasses ingestion; fake the denormalized fields that digest_event would have stored.
+        denormalized_fields = get_denormalized_fields_for_data(data)
+        calculated_type, calculated_value = get_type_and_value_for_data(data)
+        denormalized_fields["calculated_type"] = calculated_type
+        denormalized_fields["calculated_value"] = calculated_value
+
+        event = create_event(
+            project=self.project,
+            event_data=data,
+            platform=data["platform"],
+            level=maybe_empty(data.get("level", "")),
+            **denormalized_fields,
+        )
+        event.issue.calculated_type = calculated_type
+        event.issue.calculated_value = calculated_value
+        event.issue.save(update_fields=["calculated_type", "calculated_value"])
+        return event
 
     def test_capture_exception_uses_its_exception_stacktrace(self):
         data = load_generated_sample("sentry-python-capture-exception-add-full-stack.json")
@@ -73,27 +94,25 @@ class ThreadStacktraceSampleTests(TransactionTestCase):
         for filename, message, probe_filename in THREAD_STACKTRACE_SAMPLES:
             with self.subTest(filename=filename):
                 data = load_generated_sample(filename)
-                event = create_event(project=self.project, event_data=data, platform=data["platform"])
-
-                entries = get_stacktrace_entries(data)
-                self.assertEqual(1, len(entries))
-                self.assertEqual("Log Message", entries[0]["type"])
-                self.assertEqual(message, entries[0]["value"])
-                self.assertFalse(entries[0]["is_exception_stacktrace"])
+                event = self.create_event_from_sample(data)
 
                 response = self.client.get(f"/issues/issue/{event.issue.id}/event/{event.id}/")
-                self.assertContains(response, "Log Message")
                 self.assertContains(response, message)
+                html = response.content.decode()
+                self.assertIn(f">{message}</h1>", html)
+                self.assertIn(f'<span class="font-bold">{data["level"].upper()}</span>', html)
+                self.assertNotRegex(html, r"<h1[^>]*>Log Message</h1>")
                 self.assertContains(response, probe_filename)
                 self.assertNotContains(response, "capture point")
                 self.assertNotContains(response, "raise Log Message")
                 self.assertNotContains(response, "\u2192 begin")
-                self.assertNotContains(response, "Thread 1")
+                self.assertNotContains(response, "Thread #")
+                self.assertNotContains(response, "errored:")
                 self.assertNotContains(response, "No stacktrace available for this event.")
 
                 markdown = render_stacktrace_md(event)
-                self.assertIn("# Log Message", markdown)
-                self.assertIn(message, markdown)
+                self.assertIn(f"# {message}", markdown)
+                self.assertNotIn("# Log Message", markdown)
                 self.assertIn(probe_filename, markdown)
                 self.assertNotIn("Thread 1", markdown)
                 self.assertNotEqual("_No stacktrace available._", markdown)
@@ -109,23 +128,37 @@ class ThreadStacktraceSampleTests(TransactionTestCase):
                 self.assertEqual(200, response.status_code)
                 self.assertEqual(markdown, response.content.decode())
 
-    def test_multiple_threads_render_the_first_stacktrace_with_frames(self):
+    def test_multiple_threads_render_in_markdown(self):
         data = load_generated_sample(JAVA_MULTIPLE_THREADS_SAMPLE)
-        event = create_event(project=self.project, event_data=data, platform=data["platform"])
-
-        entries = get_stacktrace_entries(data)
-        self.assertEqual(1, len(entries))
-        self.assertEqual(data["threads"]["values"][1]["stacktrace"], entries[0]["stacktrace"])
-        self.assertEqual("Log Message", entries[0]["type"])
-        self.assertEqual(JAVA_MULTIPLE_THREADS_MESSAGE, entries[0]["value"])
-
-        response = self.client.get(f"/issues/issue/{event.issue.id}/event/{event.id}/")
-        self.assertContains(response, JAVA_MULTIPLE_THREADS_MESSAGE)
-        self.assertContains(response, "ProbeMultipleThreads.java")
-        self.assertNotContains(response, "bugsink-probe-background")
-        self.assertNotContains(response, "No stacktrace available for this event.")
+        event = self.create_event_from_sample(data)
 
         markdown = render_stacktrace_md(event)
+
         self.assertIn(JAVA_MULTIPLE_THREADS_MESSAGE, markdown)
+        self.assertIn("## Thread #1: main", markdown)
+        self.assertIn("## Thread #18: Notification Thread", markdown)
+        self.assertIn("## Thread #22: bugsink-probe-background", markdown)
         self.assertIn("ProbeMultipleThreads.java", markdown)
-        self.assertNotIn("bugsink-probe-background", markdown)
+        self.assertIn("lambda$main$1", markdown)
+        self.assertIn("_errored: yes, state: Runnable_", markdown)
+        self.assertNotIn("was active:", markdown)
+        self.assertEqual(2, markdown.count("_No stacktrace found._"))
+        self.assertNotIn("During handling of the above exception", markdown)
+
+    def test_exception_and_threads_render_in_markdown(self):
+        data = load_generated_sample(JAVA_EXCEPTION_THREADS_SAMPLE)
+        event = self.create_event_from_sample(data)
+
+        markdown = render_stacktrace_md(event)
+
+        self.assertIn("# IllegalStateException", markdown)
+        self.assertIn("capture_exception with all Java threads from ProbeExceptionMultipleThreads.java", markdown)
+        self.assertIn("### ProbeExceptionMultipleThreads.java:35 in `captureException`", markdown)
+        self.assertIn("# Threads", markdown)
+        self.assertLess(markdown.index("# IllegalStateException"), markdown.index("# Threads"))
+        self.assertIn("## Thread #1: main", markdown)
+        self.assertIn("## Thread #22: bugsink-probe-background", markdown)
+        self.assertIn("### ProbeExceptionMultipleThreads.java:38 in `captureException`", markdown)
+        self.assertIn("lambda$main$1", markdown)
+        self.assertEqual(2, markdown.count("_No stacktrace found._"))
+        self.assertNotIn("During handling of the above exception", markdown)

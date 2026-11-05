@@ -36,7 +36,13 @@ from .models import (
     apply_issue_action, is_valid_issue_action, q_for_invalid_issue_action)
 from .forms import CommentForm
 from .utils import get_values, get_main_exception
-from events.utils import annotate_with_meta, apply_sourcemaps, get_sourcemap_images, get_stacktrace_entries
+from events.utils import (
+    annotate_with_meta,
+    apply_sourcemaps,
+    get_sourcemap_images,
+    get_stacktrace_entries,
+    get_thread_stacktrace_entries,
+)
 from .markdown_issue import render_issue_md
 from .grouping_mechanisms import GROUPING_MECHANISMS, MECHANISM_INDEPENDENT_GROUPING
 
@@ -417,6 +423,12 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
     parsed_data = event.get_parsed_data()
 
     exceptions = get_stacktrace_entries(parsed_data)
+    thread_stacktraces = (
+        get_thread_stacktrace_entries(parsed_data)
+        if exceptions and exceptions[0]["is_exception_stacktrace"] else []
+    )
+    if len(thread_stacktraces) < 2:
+        thread_stacktraces = []
 
     try:
         # get_values for consistency (whether it's needed: unclear, since _meta is not actually in the specs)
@@ -446,19 +458,31 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
     stack_of_plates = event.platform != "python"  # Python is the only platform that has chronological stacktraces
 
     if exceptions:
-        if exceptions[-1].get('stacktrace') and exceptions[-1]['stacktrace'].get('frames'):
-            exceptions[-1]['stacktrace']['frames'][-1]['raise_point'] = True
+        is_exception_stacktrace = exceptions[0]["is_exception_stacktrace"]
+        entry_to_mark = exceptions[-1] if is_exception_stacktrace else exceptions[0]
+
+        if entry_to_mark.get('stacktrace') and entry_to_mark['stacktrace'].get('frames'):
+            entry_to_mark['stacktrace']['frames'][-1]['raise_point'] = True
 
         if stack_of_plates:
             # NOTE manipulation of parsed_data going on here, this could be a trap if other parts depend on it
             # (e.g. grouper)
-            exceptions = [e for e in reversed(exceptions)]
+            if is_exception_stacktrace:
+                exceptions = [e for e in reversed(exceptions)]
             for exception in exceptions:
                 if not exception.get('stacktrace'):
                     continue
                 if not exception.get('stacktrace').get('frames'):
                     continue
                 exception['stacktrace']['frames'] = [f for f in reversed(exception['stacktrace']['frames'])]
+
+    if stack_of_plates:
+        for thread in thread_stacktraces:
+            thread["stacktrace"]["frames"] = list(reversed(thread["stacktrace"].get("frames") or []))
+
+    multiple_thread_stacktraces = bool(
+        exceptions and len(exceptions) > 1 and not exceptions[0]["is_exception_stacktrace"]
+    )
 
     return render(request, "issues/stacktrace.html", {
         "tab": "stacktrace",
@@ -471,6 +495,8 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
         "request_repr": _request_repr(parsed_data),
         "exceptions": exceptions,
         "stack_of_plates": stack_of_plates,
+        "thread_stacktraces": thread_stacktraces,
+        "multiple_thread_stacktraces": multiple_thread_stacktraces,
         "mute_options": GLOBAL_MUTE_OPTIONS,
         "q": request.GET.get("q", ""),
         # event_qs_count is not used when there is no q, so no need to calculate it in that case
@@ -757,19 +783,19 @@ def issue_event_list(request, issue):
     # because we we need _actual events_ for display, and we don't have the regular has_prev/has_next (paginator
     # instead), we don't try to optimize using search_events_optimized in this view (except for counting)
     if "q" in request.GET:
-        event_list = search_events(issue.project, issue, request.GET["q"]).order_by("digest_order")
+        event_list = search_events(issue.project, issue, request.GET["q"]).order_by("-digest_order")
         event_x_qs = search_events_optimized(issue.project, issue, request.GET.get("q", ""))
         # we don't do the `_event_count` optimization here, because we need the correct number for pagination
         paginator = KnownCountPaginator(event_list, 250, count=event_x_qs.count())
     else:
-        event_list = issue.event_set.order_by("digest_order")
+        event_list = issue.event_set.order_by("-digest_order")
         # re 250: in general "big is good" because it allows a lot "at a glance".
         paginator = KnownCountPaginator(event_list, 250, count=issue.stored_event_count)
 
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
 
-    last_event = event_list.last()
+    last_event = event_list.first()
 
     return render(request, "issues/event_list.html", {
         "tab": "event-list",

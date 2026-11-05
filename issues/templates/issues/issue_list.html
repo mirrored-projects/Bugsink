@@ -71,7 +71,7 @@
         {% if is_global_issue_list %}
         <!-- Global tag search is intentionally hidden for now. Project-level tag search was tuned around project-scoped tag-value lookups; do not port it to cross-project search without a fresh performance pass. -->
         {% else %}
-        <input type="text" name="q" value="{{ q }}" placeholder="{% translate 'Search issues...' %}" class="bg-slate-50 dark:bg-slate-800 focus:border-cyan-500 dark:focus:border-cyan-400 focus:ring-cyan-200 dark:focus:ring-cyan-700 rounded-md"/>
+        {% include "theme/_search_input.html" with placeholder="Search issues..." %}
         {% endif %}
         </form>
     </div>
@@ -200,7 +200,7 @@
   <path stroke-linecap="round" stroke-linejoin="round" d="M17.25 9.75 19.5 12m0 0 2.25 2.25M19.5 12l2.25-2.25M19.5 12l-2.25 2.25m-10.5-6 4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z" />
 </svg>&nbsp;&nbsp;{% endif %}{{ issue.title|truncatechars:100 }}</a>
                 </div>
-                <div class="text-sm">from <b>{{ issue.first_seen|date:"j M G:i T" }}</b> | last <b>{{ issue.last_seen|date:"j M G:i T" }}</b> | {% if is_global_issue_list %}<span class="font-bold text-slate-600 dark:text-slate-300">{{ issue.friendly_id }}</span> | {% endif %}{% blocktranslate with event_count=issue.digested_event_count|intcomma %}with <b>{{ event_count }}</b> events{% endblocktranslate %}
+                <div class="text-sm">from <b>{{ issue.first_seen|date:"j M G:i T" }}</b> | last <b>{{ issue.last_seen|date:"j M G:i T" }}</b> | <span class="font-bold text-slate-600 dark:text-slate-300">{{ issue.friendly_id }}</span> | {% blocktranslate with event_count=issue.digested_event_count|intcomma %}with <b>{{ event_count }}</b> events{% endblocktranslate %}
                 {% if issue.digested_event_count != issue.stored_event_count %}
                     <span class="text-xs">({{ issue.stored_event_count|intcomma }}&thinsp;av{#ilable#})<span>
                 {% endif %}
