@@ -1,6 +1,7 @@
 import json
 from datetime import timedelta, datetime, timezone as dt_timezone
 from collections import namedtuple
+from semver import Version
 
 from django.utils import timezone
 from django.conf import settings
@@ -12,17 +13,20 @@ from django.db.models import Sum
 from django.urls import get_script_prefix
 from django.utils.timezone import localtime
 from django.template.defaultfilters import date
+from django.utils.module_loading import import_string
 
 from bugsink.app_settings import get_settings, CB_ANYBODY
 from bugsink.transaction import durable_atomic
 from bugsink.timed_sqlite_backend.base import different_runtime_limit
+from bugsink.version import version_tuple
 
 from snappea.settings import get_settings as get_snappea_settings
 from snappea.models import Task, Stat
 
-from phonehome.models import Installation
+from phonehome.models import Installation, RemoteMessage
 
 SystemWarning = namedtuple('SystemWarning', ['message', 'ignore_url'])
+RemoteWarning = namedtuple('RemoteWarning', ['parts', 'ignore_url'])
 
 
 # no_bandit_expl: literally a constant string so safe by defenition
@@ -30,6 +34,77 @@ EMAIL_BACKEND_WARNING = mark_safe(
     """Email is not set up, emails won't be sent. To get the most out of Bugsink, please
     <a href="https://www.bugsink.com/docs/settings/#email" target="_blank" class="font-bold text-slate-800
     dark:text-slate-100">set up email</a>.""")  # nosec
+
+
+def get_email_failure_warnings(installation, now):
+    diagnostics = json.loads(installation.email_sending_diagnostics)
+    cutoff = now - timedelta(minutes=5)
+    recent_attempts = []
+
+    for attempt in diagnostics.get("attempts", []):
+        attempted_at = datetime.fromisoformat(attempt["at"])
+        if attempted_at >= cutoff:
+            recent_attempts.append(attempt)
+
+    if len(recent_attempts) < 5:
+        return []
+
+    failures = len([attempt for attempt in recent_attempts if not attempt.get("ok")])
+    if failures * 2 <= len(recent_attempts):
+        return []
+
+    return [SystemWarning(
+        f"Email sending appears to be failing: {failures} of {len(recent_attempts)} recent email attempts failed.",
+        None)]
+
+
+def get_email_quota_warnings(installation, now):
+    warnings = []
+    email_quota_usage = json.loads(installation.email_quota_usage)
+
+    if get_settings().MAX_EMAILS_PER_HOUR is not None:
+        this_hour_usage = email_quota_usage.get("per_hour", {}).get(now.strftime("%Y-%m-%dT%H"), 0)
+        if this_hour_usage >= get_settings().MAX_EMAILS_PER_HOUR:
+            warnings.append(SystemWarning(
+                f"Bugsink has sent {this_hour_usage} emails this hour, which is the maximum. "
+                "No more emails will be sent until the next hour.", None))
+
+    if get_settings().MAX_EMAILS_PER_MONTH is not None:
+        this_month_usage = email_quota_usage.get("per_month", {}).get(now.strftime("%Y-%m"), 0)
+        if this_month_usage >= get_settings().MAX_EMAILS_PER_MONTH:
+            warnings.append(SystemWarning(
+                f"Bugsink has sent {this_month_usage} emails this month, which is the maximum. "
+                "No more emails will be sent until the 1st of next month.", None))
+
+    return warnings
+
+
+def get_remote_warnings(request):
+    if not getattr(request, "user", AnonymousUser()).is_superuser:
+        return []
+
+    release = []
+    for part in version_tuple:
+        if not isinstance(part, int):
+            break
+        release.append(part)
+    prerelease = version_tuple[len(release)] if len(version_tuple) > len(release) else None
+    release += [0] * (3 - len(release))
+    current_version = Version(
+        *release,
+        prerelease=prerelease,
+    )
+    return [
+        RemoteWarning(
+            list(message.parts.all()),
+            reverse("silence_remote_message", kwargs={"message_id": message.key}),
+        )
+        for message in RemoteMessage.objects.filter(
+            active=True,
+            silenced=False,
+        ).prefetch_related("parts")
+        if not message.applies_until_version or current_version < Version.parse(message.applies_until_version)
+    ]
 
 
 def get_snappea_warnings():
@@ -105,7 +180,7 @@ def useful_settings_processor(request):
         # at most once per request (at the top of the template)
         installation = Installation.objects.get()
 
-        system_warnings = []
+        system_warnings = get_remote_warnings(request)
 
         # This list does not include e.g. the dummy.EmailBackend; intentional, because setting _that_ is always an
         # indication of intentional "shut up I don't want to send emails" (and we don't want to warn about that). (as
@@ -124,18 +199,13 @@ def useful_settings_processor(request):
 
             system_warnings.append(SystemWarning(EMAIL_BACKEND_WARNING, ignore_url))
 
-        if get_settings().MAX_EMAILS_PER_MONTH is not None:
-            email_quota_usage = json.loads(installation.email_quota_usage)
-            this_month_usage = email_quota_usage.get("per_month", {}).get(timezone.now().strftime("%Y-%m"), 0)
-            if this_month_usage >= get_settings().MAX_EMAILS_PER_MONTH:
-                system_warnings.append(SystemWarning(
-                    f"Bugsink has sent {this_month_usage} emails this month, which is the maximum. "
-                    "No more emails will be sent until the 1st of next month.", None))
-
         # copy pasted from project/models.py
         now = datetime.now(dt_timezone.utc)
-        from ingest.views import BaseIngestAPIView
-        if BaseIngestAPIView.is_quota_still_exceeded(installation, now):
+        system_warnings.extend(get_email_quota_warnings(installation, now))
+        system_warnings.extend(get_email_failure_warnings(installation, now))
+
+        from ingest.digestion import is_quota_still_exceeded
+        if is_quota_still_exceeded(installation, now):
             period_name, nr_of_periods, gte_threshold = json.loads(installation.quota_exceeded_reason)
             # TODO i18n
             per_fmt = "%s %ss" % (nr_of_periods, period_name) if nr_of_periods != 1 else period_name
@@ -143,6 +213,9 @@ def useful_settings_processor(request):
             system_warnings.append(SystemWarning(
                 "Event ingestion stopped until %s. Reason: installation quota (%s events per %s) exceeded." % (
                       date_fmt, gte_threshold, per_fmt), None))
+
+        for provider_path in get_settings().SYSTEM_WARNING_PROVIDERS:
+            system_warnings.extend(import_string(provider_path)(request))
 
         return system_warnings + get_snappea_warnings()
 

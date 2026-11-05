@@ -1,3 +1,4 @@
+from urllib.parse import unquote
 from unittest import TestCase as RegularTestCase
 from unittest.mock import patch
 
@@ -8,9 +9,11 @@ from bugsink.pygments_extensions import choose_lexer_for_pattern, get_all_lexers
 from bugsink.test_utils import TransactionTestCase25251 as TransactionTestCase
 
 from events.utils import IncompleteList, IncompleteDict
+from tags.search import parse_query
 
 from .templatetags.issues import (
     _pygmentize_lines as actual_pygmentize_lines, format_var, pygmentize, timestamp_with_millis)
+from .templatetags.tag_search import _tag_clause, tag_drilldown
 
 User = get_user_model()
 
@@ -24,13 +27,15 @@ class TestPygmentizeLineLineCountHandling(RegularTestCase):
     def setUp(self):
         super().setUp()
         patcher = patch("theme.templatetags.issues.capture_stacktrace")
-        self.capture_mock = patcher.start()
+        self.the_mock_for_capture_stacktrace = patcher.start()
         self.addCleanup(patcher.stop)
 
     def _pygmentize_lines(self, lines):
         # since we exclusively care about line-counts, we just pick something for filename and platform here.
         result = actual_pygmentize_lines(lines, filename="a.py", platform="python")
-        self.capture_mock.assert_not_called()
+
+        # assert that the thing under test did not end up in the "robust, but logging" exception handling code path:
+        self.the_mock_for_capture_stacktrace.assert_not_called()
         return result
 
     def test_pygmentize_lines_empty(self):
@@ -78,27 +83,6 @@ class TestPygmentizeLineLineCountHandling(RegularTestCase):
 
     def test_pygmentize_lines_newline_on_otherwise_empty_line(self):
         self._pygmentize_lines(["\n", "\n", "\n"])
-
-    def test_pygmentize_lines_ruby_regression(self):
-        # deal with https://github.com/pygments/pygments/issues/2998
-
-        # code taken from:
-        # https://github.com/rails/rails/blob/0f969a989c87/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb
-        code = """        #  - format_type includes the column size constraint, e.g. varchar(50)
-        #  - ::regclass is a function that gives the id for a table name
-        def column_definitions(table_name) #:nodoc:
-          exec_query(<<-end_sql, 'SCHEMA').rows
-              SELECT a.attname, format_type(a.atttypid, a.atttypmod),
-                     pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod
-                FROM pg_attribute a LEFT JOIN pg_attrdef d"""
-
-        code_as_list = code.splitlines()
-        result = actual_pygmentize_lines(code_as_list, filename="postgresql_adapter.rb", platform="ruby")
-        self.assertEqual(len(code_as_list), len(result))
-        self.capture_mock.assert_called()
-        for line in result:
-            # we can't rely on pygments in this case, so the string must not be marked as safe.
-            self.assertNotIsInstance(line, SafeString)
 
 
 class TestChooseLexerForPattern(RegularTestCase):
@@ -231,6 +215,36 @@ class TimestampWithMillisTagTest(RegularTestCase):
         self.assertFalse(isinstance(timestamp_with_millis(ts), SafeString))
 
 
+class TagDrilldownTest(RegularTestCase):
+    def test_clause_quotes_and_escapes(self):
+        self.assertEqual('browser:"Fire fox"', _tag_clause("browser", "Fire fox"))
+        self.assertEqual(r'k:"a \"b\" \\c"', _tag_clause("k", r'a "b" \c'))
+
+    def test_clause_quotes_keys_with_search_syntax(self):
+        self.assertEqual('"bugsink:release":"1.2"', _tag_clause("bugsink:release", "1.2"))
+
+        # This just documents "what is" rather than "what I believe is right": these are not valid Sentry tag keys.
+        self.assertEqual(
+            r'"key with \"quote\" and \\slash":"value"',
+            _tag_clause('key with "quote" and \\slash', "value"))
+
+    def test_no_current_query_is_just_the_clause(self):
+        self.assertEqual('browser:"Firefox"', unquote(tag_drilldown("", "browser", "Firefox")))
+
+    def test_appends_to_current_query_for_drilldown(self):
+        self.assertEqual('os:"Linux" browser:"Firefox"', unquote(tag_drilldown('os:"Linux"', "browser", "Firefox")))
+
+    def test_output_is_url_encoded(self):
+        out = tag_drilldown('os:"Linux"', "browser", "Firefox")
+        self.assertNotIn('"', out)
+        self.assertNotIn(' ', out)
+        self.assertIn('%22', out)
+
+    def test_colon_key_roundtrips_through_drilldown_and_parser(self):
+        query = unquote(tag_drilldown("", "bugsink:release", "1.2"))
+        self.assertEqual(({"bugsink:release": "1.2"}, ""), parse_query(query))
+
+
 class NavigationLinksTestCase(TransactionTestCase):
     """Tests for navigation links in base.html template."""
 
@@ -267,14 +281,14 @@ class NavigationLinksTestCase(TransactionTestCase):
         self.assertContains(response, 'Preferences')
         self.assertContains(response, '/api/canonical/0/schema/swagger-ui/')
         self.assertContains(response, 'OpenAPI')
+        self.assertContains(response, '/bsmain/auth_tokens/')
+        self.assertContains(response, 'Tokens')
 
         # Admin only. Not visible
         self.assertNotContains(response, '/admin/')
         self.assertNotContains(response, 'Admin')
         self.assertNotContains(response, '/users/')
         self.assertNotContains(response, 'Users')
-        self.assertNotContains(response, '/bsmain/auth_tokens/')
-        self.assertNotContains(response, 'Tokens')
 
     def test_anonymous_user_sees_no_links(self):
         """Anonymous users should see no links in the navigation."""

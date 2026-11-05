@@ -32,7 +32,7 @@ from bugsink.timed_sqlite_backend.base import different_runtime_limit
 from bugsink.utils import is_safe_next_url
 
 from phonehome.utils import phone_home
-from phonehome.models import Installation
+from phonehome.models import Installation, RemoteMessage
 
 from ingest.views import BaseIngestAPIView
 from bsmain.models import CachedModelCount
@@ -56,6 +56,12 @@ def cors_for_api_view(view):
 # avoid monkey-patching, this will only affect me (DEBUG=True) so it should be OK.
 debug.technical_404_response = cors_for_api_view(debug.technical_404_response)
 debug.technical_500_response = cors_for_api_view(debug.technical_500_response)
+
+
+def _exception_for_error_page(exception):
+    if get_bugsink_settings().MINIMIZE_INFORMATION_EXPOSURE:
+        return Exception("")
+    return exception
 
 
 @phone_home
@@ -224,12 +230,23 @@ def silence_email_system_warning(request):
     return HttpResponseRedirect(next_url)
 
 
+@user_passes_test(lambda u: u.is_superuser)
+@require_POST
+@atomic_for_request_method
+def silence_remote_message(request, message_id):
+    RemoteMessage.objects.filter(key=message_id).update(silenced=True)
+
+    next_url = request.POST.get("next", "/")
+    if not is_safe_next_url(next_url, request):
+        next_url = "/"
+    return HttpResponseRedirect(next_url)
+
+
 @requires_csrf_token
 @cors_for_api_view
 def bad_request(request, exception, template_name=ERROR_400_TEMPLATE_NAME):
     # verbatim copy of Django's default bad_request view, but with "exception" in the context
-    # doing this for any-old-Django-site is probably a bad idea, but here the security/convenience tradeoff is fine,
-    # especially because we only show str(exception) in the template.
+    # (unless MINIMIZE_INFORMATION_EXPOSURE is enabled).
     if request.path.startswith("/api/"):
         template_name = "4xx_5xx_api.txt"
 
@@ -243,15 +260,14 @@ def bad_request(request, exception, template_name=ERROR_400_TEMPLATE_NAME):
             ERROR_PAGE_TEMPLATE % {"title": "Bad Request (400)", "details": ""},
         )
 
-    return HttpResponseBadRequest(template.render({"exception": exception}))
+    return HttpResponseBadRequest(template.render({"exception": _exception_for_error_page(exception)}))
 
 
 @requires_csrf_token
 @cors_for_api_view
 def server_error(request, template_name=ERROR_500_TEMPLATE_NAME):
     # verbatim copy of Django's default server_error view, but with "exception" in the context
-    # doing this for any-old-Django-site is probably a bad idea, but here the security/convenience tradeoff is fine,
-    # especially because we only show str(exception) in the template.
+    # (unless MINIMIZE_INFORMATION_EXPOSURE is enabled).
     _, exception, _ = sys.exc_info()
 
     if request.path.startswith("/api/"):
@@ -267,7 +283,7 @@ def server_error(request, template_name=ERROR_500_TEMPLATE_NAME):
             ERROR_PAGE_TEMPLATE % {"title": "Server Error (500)", "details": ""},
         )
 
-    return HttpResponseServerError(template.render({"exception": exception}))
+    return HttpResponseServerError(template.render({"exception": _exception_for_error_page(exception)}))
 
 
 @requires_csrf_token
@@ -280,7 +296,7 @@ def permission_denied(request, exception, template_name=ERROR_403_TEMPLATE_NAME)
     # * try to give a correct content-type on-response
     if request.path.startswith("/api/"):
         template_name = "4xx_5xx_api.txt"
-    return django_permission_denied(request, exception, template_name)
+    return django_permission_denied(request, _exception_for_error_page(exception), template_name)
 
 
 @requires_csrf_token
@@ -288,4 +304,4 @@ def permission_denied(request, exception, template_name=ERROR_403_TEMPLATE_NAME)
 def page_not_found(request, exception, template_name=ERROR_404_TEMPLATE_NAME):
     if request.path.startswith("/api/"):
         template_name = "4xx_5xx_api.txt"
-    return django_page_not_found(request, exception, template_name)
+    return django_page_not_found(request, _exception_for_error_page(exception), template_name)

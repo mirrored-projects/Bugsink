@@ -12,18 +12,21 @@ from alerts.views import debug_email as debug_alerts_email
 from users.views import debug_email as debug_users_email
 from teams.views import debug_email as debug_teams_email
 from bugsink.app_settings import get_settings
-from users.views import signup, confirm_email, resend_confirmation, request_reset_password, reset_password, preferences
+from users.views import (
+    signup, confirm_email, resend_confirmation, request_reset_password, reset_password, preferences, change_password)
 from ingest.views import download_envelope
 from files.views import chunk_upload, artifact_bundle_assemble, difs_assemble, api_root, api_catch_all
 from bugsink.decorators import login_exempt
+from bugsink.permissions import IsAuthTokenAuthenticated
 
 from events.api_views import EventViewSet
-from issues.api_views import IssueCommentViewSet, IssueViewSet
+from issues.api_views import IssueCommentViewSet, IssueHistoryViewSet, IssueViewSet
 from projects.api_views import ProjectViewSet
 from releases.api_views import ReleaseViewSet
 from teams.api_views import TeamViewSet
 
 from .views import home, trigger_error, favicon, settings_view, silence_email_system_warning, counts, health_check_ready
+from .views import silence_remote_message
 from .debug_views import csrf_debug
 
 
@@ -32,9 +35,15 @@ admin.site.site_title = get_settings().SITE_TITLE
 admin.site.index_title = "Admin"  # everyone calls this the "admin" anyway. Let's set the title accordingly.
 
 
+class CanonicalAPIRootView(routers.APIRootView):
+    permission_classes = [IsAuthTokenAuthenticated]
+
+
 api_router = routers.DefaultRouter()
+api_router.APIRootView = CanonicalAPIRootView
 api_router.register(r'events', EventViewSet)
 api_router.register(r'issue-comments', IssueCommentViewSet, basename='issue-comment')
+api_router.register(r'issue-history', IssueHistoryViewSet, basename='issue-history')
 api_router.register(r'issues', IssueViewSet)
 api_router.register(r'projects', ProjectViewSet)
 api_router.register(r'releases', ReleaseViewSet)
@@ -57,6 +66,7 @@ urlpatterns = [
     path("accounts/logout/", auth_views.LogoutView.as_view(template_name="users/logged_out.html"), name="logout"),
 
     path("accounts/preferences/", preferences, name="preferences"),
+    path("accounts/change-password/", change_password, name="change_password"),
 
     # many user-related views are directly exposed above (/accounts/), the rest is here:
     path("users/", include("users.urls")),
@@ -95,10 +105,20 @@ urlpatterns = [
          RedirectView.as_view(url='/bsmain/auth_tokens/', permanent=False)),
 
     path('bsmain/', include('bsmain.urls')),
+]
 
+for urlconf_module in get_settings().EXTRA_URLCONF_MODULES:
+    urlpatterns.append(path("", include(urlconf_module)))
+
+urlpatterns += [
     path('admin/', admin.site.urls),
 
     path('silence-email-system-warning/', silence_email_system_warning, name='silence_email_system_warning'),
+    path(
+        'silence-remote-message/<slug:message_id>/',
+        silence_remote_message,
+        name='silence_remote_message',
+    ),
     path('settings/', settings_view, name='settings'),
     path('counts/', counts, name='counts'),
     path('debug/csrf/', csrf_debug, name='csrf_debug'),

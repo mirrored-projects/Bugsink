@@ -1,10 +1,13 @@
-from django.utils.encoding import force_str
+from collections import namedtuple
 
-from sentry.stacktraces.functions import get_function_name_for_frame
-from sentry.stacktraces.processing import get_crash_frame_from_event_data, get_crash_location
-from sentry.utils.safe import get_path, trim
+from sentry.at_glitchtip_af9a700a8706.stacktraces.functions import get_function_name_for_frame
+from sentry.at_glitchtip_af9a700a8706.stacktraces.processing import get_crash_frame_from_event_data, get_crash_location
+from sentry.at_glitchtip_af9a700a8706.utils.safe import get_path, trim
 
-from sentry.utils.strings import strip
+from sentry.at_glitchtip_af9a700a8706.utils.strings import strip
+
+
+LOG_MESSAGE_TYPE = "Log Message"
 
 
 def maybe_empty(s):
@@ -54,17 +57,15 @@ def get_type_and_value_for_data(data):
 
 
 def get_exception_type_and_value_for_logmessage(data):
-    """In Sentry's data-model, log messages are retrofitted into the event model; personally I'm not a fan of using an
-    Error Tracking tool for logging, but we at least make sure to show meaningful titles for log messages. The Bugsink
-    choice is: just use "Log Message" as the type, which at least clarifies what you're looking at"""
+    """Use "Log Message" to classify non-exception events internally; their message is the useful display title."""
 
     message = strip(
-        get_path(data, "logentry", "message")
-        or get_path(data, "logentry", "formatted")
+        get_path(data, "logentry", "formatted")
+        or get_path(data, "logentry", "message")
 
         # top-level "message" (deprecated, but still used by some SDKs, with a dict as with "logentry")
-        or get_path(data, "message", "message")
         or get_path(data, "message", "formatted")
+        or get_path(data, "message", "message")
     )
 
     if not message and isinstance(data.get("message"), str):
@@ -72,9 +73,9 @@ def get_exception_type_and_value_for_logmessage(data):
         message = data.get("message")
 
     if message:
-        return "Log Message", message.splitlines()[0][:1024]
+        return LOG_MESSAGE_TYPE, message.splitlines()[0][:1024]
 
-    return "Log Message", "<no log message>"
+    return LOG_MESSAGE_TYPE, "<no log message>"
 
 
 def get_main_exception(data):
@@ -132,43 +133,43 @@ def get_exception_type_and_value_for_exception(data):
     return type_, value
 
 
-def default_issue_grouper(calculated_type, calculated_value, transaction):
-    # This is the "default" issue grouper, both in the sense that it's the issue-grouper that's used for the part of the
-    # fingerprint named "{{ default }}" and in the sense that it's the default issue grouper when no fingerprint is
-    # provided. It's a simple issue grouper that concatenates the title and the transaction.
-
-    title = get_title_for_exception_type_and_value(calculated_type, calculated_value)
-    return title + " ⋄ " + transaction
+KeyWithMechanism = namedtuple("KeyWithMechanism", ["key", "mechanism"])
 
 
-def get_issue_grouper_for_data(data, calculated_type=None, calculated_value=None):
-    if calculated_type is None and calculated_value is None:
-        # convenience for calling code from tests, when digesting we don't do this because we already have this info
-        calculated_type, calculated_value = get_type_and_value_for_data(data)
+def get_key_with_mechanism_for_data(data, grouping_mechanism):
+    from issues.grouping_mechanisms import MECHANISM_INDEPENDENT_GROUPING, get_grouping_mechanism
 
-    transaction = force_str(data.get("transaction") or "<no transaction>")
     fingerprint = data.get("fingerprint")
+    mechanism = get_grouping_mechanism(grouping_mechanism)
+    calculated_type, calculated_value = mechanism.get_type_and_value_for_data(data)
 
     if fingerprint:
-        return " ⋄ ".join([
-            (default_issue_grouper(calculated_type, calculated_value, transaction)
-             if part == "{{ default }}"
-             else str(part))
-            for part in fingerprint
-        ])
+        used_default = False
+        parts = []
+        for part in fingerprint:
+            if part == "{{ default }}":
+                used_default = True
+                parts.append(mechanism.grouper(data, calculated_type, calculated_value))
+            else:
+                parts.append(str(part))
 
-    return default_issue_grouper(calculated_type, calculated_value, transaction)
+        return KeyWithMechanism(
+            " ⋄ ".join(parts),
+            grouping_mechanism if used_default else MECHANISM_INDEPENDENT_GROUPING,
+        )
+
+    return KeyWithMechanism(mechanism.grouper(data, calculated_type, calculated_value), grouping_mechanism)
 
 
 def get_title_for_exception_type_and_value(type_, value):
-    # This is a simple function that formats the type and value of an exception in a way that's suitable for use as a
-    # title. It's used in grouping, but also to actually display the title of an issue in the UI.
-
     if not value:
         return type_
 
     if not isinstance(value, str):
         value = str(value)
+
+    if type_ == LOG_MESSAGE_TYPE:
+        return value.splitlines()[0]
 
     return "{}: {}".format(type_, value.splitlines()[0])
 

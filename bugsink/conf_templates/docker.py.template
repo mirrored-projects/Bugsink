@@ -1,7 +1,6 @@
 import os
-from urllib.parse import urlparse
 
-from bugsink.conf_utils import deduce_allowed_hosts, eat_your_own_dogfood, deduce_script_name, int_or_none
+from bugsink.conf_utils import deduce_allowed_hosts, eat_your_own_dogfood, deduce_script_name, int_or_none, parse_database_url
 
 from bugsink.settings.default import *  # noqa
 from bugsink.settings.default import DATABASES
@@ -84,32 +83,7 @@ DATABASES["snappea"]["NAME"] = '/tmp/snappea.sqlite3'
 
 
 if os.getenv("DATABASE_URL"):
-    DATABASE_URL = os.getenv("DATABASE_URL")
-    parsed = urlparse(DATABASE_URL)
-
-    if parsed.scheme == "mysql":
-        DATABASES['default'] = {
-            'ENGINE': 'django.db.backends.mysql',
-            'NAME': parsed.path.lstrip('/'),
-            "USER": parsed.username,
-            "PASSWORD": parsed.password,
-            "HOST": parsed.hostname,
-            "PORT": parsed.port or "3306",
-        }
-
-    elif parsed.scheme in ["postgres", "postgresql"]:
-        DATABASES['default'] = {
-            'ENGINE': 'django.db.backends.postgresql',
-            'NAME': parsed.path.lstrip('/'),
-            "USER": parsed.username,
-            "PASSWORD": parsed.password,
-            "HOST": parsed.hostname,
-            "PORT": parsed.port or "5432",
-        }
-
-    else:
-        raise ValueError("For DATABASE_URL, only mysql and postgres are supported, not '%s'" % parsed.scheme)
-
+    DATABASES['default'] = parse_database_url(os.getenv("DATABASE_URL"))
 else:
     # similar to the default, but the fallback is /data/db.sqlite3; we also create the directory if it doesn't exist,
     # which allows for throwaway setups (no volume mounted) to work out of the box.
@@ -117,28 +91,32 @@ else:
     database_path = os.path.dirname(DATABASES['default']['NAME'])
 
 
-if os.getenv("EMAIL_HOST"):
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"  # default, here for explicitness
-    EMAIL_HOST = os.getenv("EMAIL_HOST")
-    EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
-    EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
-    EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
-    # When neither EMAIL_USE_xxx is set, we default to EMAIL_USE_TLS=True (this matches port 587). If either is set to
-    # True, we use that.
-    EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "False").lower() in ("true", "1", "yes")
-    EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", str(not EMAIL_USE_SSL)).lower() in ("true", "1", "yes")
-
-    if os.getenv("EMAIL_LOGGING", "false").lower() in ("true", "1", "yes"):
-        LOGGING['loggers']['bugsink.email']['level'] = "INFO"
-
+if os.getenv("EMAIL_BACKEND"):
+    EMAIL_BACKEND = os.getenv("EMAIL_BACKEND")
+elif os.getenv("EMAIL_HOST"):
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 else:
     # print("WARNING: EMAIL_HOST not set; email will not be sent")
     EMAIL_BACKEND = "bugsink.email_backends.QuietConsoleEmailBackend"
+
+if EMAIL_BACKEND == "django.core.mail.backends.smtp.EmailBackend" or os.getenv("EMAIL_HOST"):
+    EMAIL_HOST = os.getenv("EMAIL_HOST") or "localhost"
+    EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER")
+    EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD")
+    EMAIL_PORT = int(os.getenv("EMAIL_PORT", 587))
+
+    # When neither EMAIL_USE_xxx is set, we default to EMAIL_USE_TLS=True (this matches port 587).
+    EMAIL_USE_SSL = os.getenv("EMAIL_USE_SSL", "False").lower() in ("true", "1", "yes")
+    EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", str(not EMAIL_USE_SSL)).lower() in ("true", "1", "yes")
+
+if os.getenv("EMAIL_LOGGING", "false").lower() in ("true", "1", "yes"):
+    LOGGING['loggers']['bugsink.email']['level'] = "INFO"
 
 if os.getenv("EMAIL_TIMEOUT"):
     EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT"))
 
 SERVER_EMAIL = DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "Bugsink <bugsink@example.org>")
+
 
 # constants for "create by" (user/team/project) settings
 CB_ANYBODY = "CB_ANYBODY"
@@ -154,7 +132,7 @@ BUGSINK = {
     # you can customize this as e.g. "My Bugsink" or "Bugsink for My Company"
     "SITE_TITLE": os.getenv("SITE_TITLE", "Bugsink"),
 
-    "USE_ADMIN": os.getenv("USE_ADMIN", False),
+    "USE_ADMIN": os.getenv("USE_ADMIN", "False").lower() in ("true", "1", "yes"),
 
     # Settings for Users, Teams and Projects
     "SINGLE_USER": os.getenv("SINGLE_USER", "False").lower() in ("true", "1", "yes"),
@@ -172,6 +150,7 @@ BUGSINK = {
 
     # MAX* below mirror the (current) values for the Sentry Relay.
     "MAX_EVENT_SIZE": int(os.getenv("MAX_EVENT_SIZE", _MEBIBYTE)),
+    "MAX_ATTACHMENT_SIZE": int(os.getenv("MAX_ATTACHMENT_SIZE", 100 * _MEBIBYTE)),
     "MAX_EVENT_COMPRESSED_SIZE": int(os.getenv("MAX_EVENT_COMPRESSED_SIZE", 200 * _KIBIBYTE)),
     "MAX_ENVELOPE_SIZE": int(os.getenv("MAX_ENVELOPE_SIZE", 100 * _MEBIBYTE)),
     "MAX_ENVELOPE_COMPRESSED_SIZE": int(os.getenv("MAX_ENVELOPE_COMPRESSED_SIZE", 20 * _MEBIBYTE)),
@@ -179,6 +158,7 @@ BUGSINK = {
     "MAX_EVENT_TAGS": int(os.getenv("MAX_EVENT_TAGS", 100)),
     # For large MAX_FILE_SIZE values, you may want FILE_OBJECT_STORAGE_PATH configured too.
     "MAX_FILE_SIZE": int(os.getenv("MAX_FILE_SIZE", 2 * _GIBIBYTE)),
+    "MAX_SOURCE_CONTEXT_FILE_SIZE": int(os.getenv("MAX_SOURCE_CONTEXT_FILE_SIZE", 10 * _MEBIBYTE)),
 
     # Bugsink-specific limits:
     # The default values are 1_000, 5_000, 1M respectively; which corresponds to ~6%, ~2.7%, .8% of the total capacity
@@ -190,6 +170,9 @@ BUGSINK = {
     "MAX_EVENTS_PER_5_MINUTES": int(os.getenv("MAX_EVENTS_PER_5_MINUTES", 1_000)),
     "MAX_EVENTS_PER_HOUR": int(os.getenv("MAX_EVENTS_PER_HOUR", 5_000)),
     "MAX_EVENTS_PER_MONTH": int(os.getenv("MAX_EVENTS_PER_MONTH", 1_000_000)),
+
+    "MAX_EMAILS_PER_HOUR": int_or_none(os.getenv("MAX_EMAILS_PER_HOUR", 60)),
+    "MAX_EMAILS_PER_MONTH": int_or_none(os.getenv("MAX_EMAILS_PER_MONTH", None)),
 
     "MAX_RETENTION_PER_PROJECT_EVENT_COUNT": int_or_none(os.getenv("MAX_RETENTION_PER_PROJECT_EVENT_COUNT", None)),
     "MAX_RETENTION_EVENT_COUNT": int_or_none(os.getenv("MAX_RETENTION_EVENT_COUNT", None)),
@@ -212,6 +195,7 @@ BUGSINK = {
     # Webhook outbound security:
     # * ALERTS_WEBHOOK_OUTBOUND_MODE=open|allowlist_only
     # * ALERTS_WEBHOOK_ALLOW_LIST / ALERTS_WEBHOOK_DENY_LIST accept comma-separated hostname/IP/CIDR entries.
+    #   For Telegram alerts in allowlist_only mode, allow api.telegram.org.
     # * ALERTS_WEBHOOK_DENY_NON_GLOBAL blocks non-global destination IPs by default.
     "ALERTS_WEBHOOK_OUTBOUND_MODE": os.getenv("ALERTS_WEBHOOK_OUTBOUND_MODE", "open").lower(),
     "ALERTS_WEBHOOK_ALLOW_LIST":
@@ -222,6 +206,7 @@ BUGSINK = {
         os.getenv("ALERTS_WEBHOOK_DENY_NON_GLOBAL", "true").lower() in ("true", "1", "yes"),
 
     # Feature flags
+    "FEATURE_BROTLI": os.getenv("FEATURE_BROTLI", "true").lower() in ("true", "1", "yes"),
     "FEATURE_MINIDUMPS": os.getenv("FEATURE_MINIDUMPS", "false").lower() in ("true", "1", "yes"),
 }
 
@@ -242,6 +227,7 @@ if os.getenv("FILE_EVENT_STORAGE_PATH"):
         },
     }
 
+# NOTE: basepath and get_basepath must provide separate directories for different object kinds.
 if os.getenv("FILE_OBJECT_STORAGE_PATH"):
     BUGSINK["OBJECT_STORAGES"] = {
         "file": {

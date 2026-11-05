@@ -1,6 +1,8 @@
 from datetime import timedelta
 
 from django.contrib.auth import login
+from django.contrib.auth import update_session_auth_hash
+from django.contrib.auth.forms import PasswordChangeForm
 from django.shortcuts import render, redirect, reverse
 from django.contrib.auth import get_user_model
 from django.http import Http404
@@ -112,7 +114,8 @@ def signup(request):
 def confirm_email(request, token=None):
     # clean up expired tokens; doing this on every request is just fine, it saves us from having to run a cron job-like
     EmailVerification.objects.filter(
-        created_at__lt=timezone.now() - timedelta(get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
+        created_at__lt=timezone.now() - timedelta(
+            seconds=get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
 
     try:
         verification = EmailVerification.objects.get(token=token)
@@ -189,7 +192,8 @@ def reset_password(request, token=None):
     # clean up expired tokens; doing this on every request is just fine, it saves us from having to run a cron
     # job-like thing
     EmailVerification.objects.filter(
-        created_at__lt=timezone.now() - timedelta(get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
+        created_at__lt=timezone.now() - timedelta(
+            seconds=get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
 
     try:
         verification = EmailVerification.objects.get(token=token)
@@ -234,8 +238,9 @@ def preferences(request):
         if form.is_valid():
             user = form.save()
 
-            # activate the selected language immediately for the Success message; we've already passed the middleware
-            # stage (which looked at the pre-change language), so we need to do this ourselves with the fresh value.
+            # activate the selected language immediately for the Success message; we've already passed the
+            # middleware stage (which looked at the pre-change language), so we need to do this ourselves with the
+            # fresh value.
             translation.activate(get_chosen_language(user, request))
 
             messages.success(request, _("Updated preferences"))
@@ -245,6 +250,29 @@ def preferences(request):
         form = PreferencesForm(instance=user)
 
     return render(request, 'users/preferences.html', {
+        'form': form,
+    })
+
+
+@atomic_for_request_method
+# in the general case this is done by Middleware but we're under /accounts/, so we need it back.
+# not security-critical because we simply get a failure on request.user if this wasn't there, but still the right thing.
+@login_required
+def change_password(request):
+    user = request.user
+    if request.method == 'POST':
+        form = PasswordChangeForm(user, request.POST)
+
+        if form.is_valid():
+            form.save()
+            update_session_auth_hash(request, user)
+            messages.success(request, _("Password updated"))
+            return redirect('preferences')
+
+    else:
+        form = PasswordChangeForm(user)
+
+    return render(request, 'users/change_password.html', {
         'form': form,
     })
 

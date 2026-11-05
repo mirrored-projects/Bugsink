@@ -1,10 +1,303 @@
 # Changes
 
-## Unreleased
+## 2.6.2 (22 October 2026)
 
-* Add native support for CSP violation reports via a new `/api/<project_pk>/security/` endpoint, compatible with the
-  `report-uri` directive browsers emit. Reports are translated into events and pushed through the existing envelope
-  pipeline, grouped by `(effective-directive, blocked-uri)`.
+### Security
+
+#### Artifact assembly loads chunks before checking their combined size
+
+Fix: reject oversized artifact uploads before loading their chunks into memory.
+
+An API token with `debug-files:upload` access could previously cause excessive memory use during source-map uploads.
+The assembled-file size check ran after loading the chunks. This fix also applies when experimental minidump support is
+disabled.
+
+See [the security advisory](https://github.com/bugsink/bugsink/security/advisories/GHSA-f8c4-h8vr-rh5v).
+
+#### Artifact bundle ZIP parsing can exhaust memory
+
+Fix: limit decompressed artifact-bundle manifests to 50 MiB (or `MAX_FILE_SIZE`, if lower).
+
+Manifests previously used the much larger general file-size limit, allowing an authorized uploader to cause excessive
+memory use with a highly compressed manifest.
+
+Artifact-bundle ZIP entries must now use Stored or DEFLATE compression. Rejecting BZIP2 and LZMA avoids decompressor
+memory-exhaustion bugs on affected Python versions, even when Bugsink limits how many decompressed bytes it reads.
+
+See [the security advisory](https://github.com/bugsink/bugsink/security/advisories/GHSA-mcpx-frgv-p228).
+
+#### Docker certificate trust stores affected by the eMudhra CA incident
+
+Fix: update certificate trust stores following the eMudhra/emSign CA incident.
+
+Bugsink now requires `certifi>=2026.10.19`. Docker builds also install pip 26.2.2 from a hash-verified wheel before
+downloading packages and refresh the system CA bundle. Recreate running containers from the updated image to apply
+these changes. See #559 and the [Python Packaging incident guidance](https://discuss.python.org/t/109576).
+
+See [the security advisory](https://github.com/bugsink/bugsink/security/advisories/GHSA-2r4m-8qhq-j364).
+
+### Backwards incompatible changes
+
+Python 3.10 is no longer supported. Bugsink now requires Python 3.11 or newer. Docker users do not need to change their
+host's Python installation. See #199.
+
+### Canonical API
+
+* Search issues and events using the same query syntax as the UI, and filter issues by state. See #558.
+* List issues across accessible projects in one request, and look up an event by its SDK event ID and project. See #558.
+* Retrieve issue history, including state changes, comments and author names, with cursor pagination. See #554.
+* Retrieve an issue's tag counts and grouping keys, and hourly event counts for issues and projects. See #558.
+* Include release information and mute conditions in issue responses and custom webhook payloads. See #558.
+* Document search syntax and friendly issue IDs in the API schema. See #558.
+
+### Experimental minidumps
+
+Minidump support remains experimental and requires `FEATURE_MINIDUMPS`.
+It got the following improvements in this release:
+
+* Apply `MAX_ATTACHMENT_SIZE` to direct minidump uploads, whether compressed or uncompressed, and reject oversized
+  requests with HTTP 413. The limit covers the whole decompressed multipart request, including fields and overhead.
+  `MAX_ATTACHMENT_SIZE` is now also configurable through the Docker environment.
+* Check installation and project quotas before accepting direct minidump uploads.
+* Limit decompressed source-context files to 10 MiB by default, configurable with `MAX_SOURCE_CONTEXT_FILE_SIZE`.
+  Omit source context when a file exceeds the limit. See #555.
+* Avoid unnecessary source-bundle manifest parsing by Symbolic, and only read Stored or DEFLATE ZIP entries when
+  extracting source context.
+* Parse minidumps before entering the database write transaction. Reuse debug files across matching stack frames and
+  release their contents after use, reducing repeated reads, parsing and memory use.
+* Assemble debug files in background tasks, with upload status available to `sentry-cli` while it polls for completion.
+* Fix direct minidump ingestion and avoid processing minidump-only envelopes twice. See #532.
+
+### Smaller fixes
+
+* Support source context in sectioned source maps, and match source-map debug images using a frame's `abs_path` before
+  falling back to `filename`. This fixes matching for Cloudflare Workers events. See #550 and #553.
+* Keep uploaded chunks available for other files that share them, instead of deleting them after the first assembly.
+  Chunks are removed by age-based cleanup. See #546.
+* Shed already-queued, over-quota events before entering the database write transaction, and move event schema
+  validation outside that transaction. See #494 and #557.
+* Handle multipart uploads with Chunked Transfer-Encoding under Gunicorn, rather than treating their files as absent.
+* Enforce the 1,000,000-byte body-size limit for uncompressed multipart requests when `API_LOG_UNIMPLEMENTED_CALLS` is
+  enabled. Oversized requests now receive HTTP 413. This debug logging option is disabled by default.
+* Make tag values clickable filters that narrow the current search, and add clear buttons to search fields. See #527
+  and #538.
+* Show whether events are arriving on SDK setup pages. See #531.
+* Add copy buttons next to auth tokens. See #525.
+* Ask for confirmation before leaving a team, and prevent its last accepted admin from leaving. See #534.
+* Refuse email delivery to `@bugsink.com` recipients, avoiding accidental notifications to the Bugsink maintainers.
+  See #536.
+* Reject conflicting reuse of event IDs without raising an unhandled exception, and tolerate malformed stacktrace
+  frame containers. See #537 and #533.
+* Keep Tailwind's development watcher output consistent with production builds and update development-only npm
+  dependencies. See #539, #541, #547 and #556.
+
+## 2.6.1 (25 September 2026)
+
+### Smaller fixes
+
+* Fix Snappea memory growth after source-map uploads by counting database queries without retaining their contents, and
+  avoid loading duplicate uploaded files into memory. See #523.
+* Allow project-bound API tokens with `projects:read` to list and retrieve their bound project. See #520.
+* Fix server errors on the canonical API root and on `OPTIONS` requests made with valid API tokens. See #516.
+
+## 2.6.0 (15 September 2026)
+
+### Scoped API tokens
+
+Users can now create personal API tokens that follow their current permissions, optionally limited to one project.
+Each token has an explicit set of capabilities, such as reading issues, triaging them or uploading debug files.
+Superusers can also create service tokens for integrations that should operate independently of a user account.
+These limits are enforced in both the canonical and Sentry-compatible APIs, and endpoint requirements are included
+in the OpenAPI documentation. See #216.
+
+Existing tokens keep their full installation-wide access after upgrading. Tokens can be revoked from the token list.
+
+### Request-URL search
+
+Issue and event searches can now filter by request URL, for example `url:"https://example.org/checkout"`. URLs are stored
+as tags for newly ingested events, with query strings and fragments removed so equivalent pages share a value.
+See #269.
+
+### Alert destinations
+
+Alerts can now be sent to Google Chat spaces using incoming webhooks. See #326.
+
+### Smaller fixes
+
+* Show newest events first in an issue's event list, including filtered results, see #485.
+* Show friendly issue IDs in project issue lists, see #509.
+* Apply Docker SMTP environment settings when `EMAIL_BACKEND` is explicitly configured, and allow `EMAIL_LOGGING`
+  independently of SMTP configuration. Selecting SMTP without `EMAIL_HOST` now uses localhost with port 587 and TLS
+  by default. See #502.
+* Tell SDKs to stop sending unsupported transaction and span data, reducing unnecessary ingestion traffic, see #500.
+* Parse quoted search terms consistently, including colons in values and escaped quotes, see #501.
+* Prevent project updates through the canonical API from moving a project to another team, see #216.
+* Update Gunicorn to 26.2, Django REST Framework to 3.18 and Pygments to 2.21, see #498, #486 and #489.
+
+## 2.5.1 (31 August 2026)
+
+### Backwards incompatible changes
+
+Some _very ancient_ migration files, long since squashed and replaced, have been removed. In the unlikely event that
+you are running a pre-1.2.0 release and have not yet run migrations, you will need to upgrade to any release from 1.2.0
+to 2.5.0 and run migrations before upgrading to 2.5.1 or later. See #470.
+
+### Security
+
+Fix: enforce the configured lifetime for email verification, password-reset and new-user setup links.
+
+The lifetime setting is expressed in seconds but was interpreted as days, so unused links remained valid far beyond
+their configured expiry. Bugsink now expires them after the configured number of seconds. See:
+
+https://github.com/bugsink/bugsink/security/advisories/GHSA-4f45-qmjf-82cv
+
+Fix: reject webhook targets with non-global IPv4 addresses embedded in IPv6 destinations.
+
+On installations with NAT64 routing, a project admin could use a globally classified IPv6 address that translated to
+a private, loopback or link-local IPv4 destination. Bugsink now applies the global-address requirement to IPv4
+addresses embedded in standard IPv6 transition formats. See:
+
+https://github.com/bugsink/bugsink/security/advisories/GHSA-qxqr-25p3-664q
+
+### Alert destinations
+
+Alerts can now be sent to Telegram, Microsoft Teams and custom webhook endpoints. Telegram supports channels, groups
+and topics, Microsoft Teams uses Power Automate Workflows, and custom webhooks receive a payload based on the canonical
+issue API. See #368, #433 and #461.
+
+### Stacktraces and log messages
+
+Log-message issues now use the actual message as their title instead of the generic "Log Message" label, including the
+formatted message when an SDK provides one. See #111 and #364.
+
+Stacktrace views now render thread-based stacktraces from message and log events, show multiple threads alongside
+exceptions, and support the deprecated top-level event stacktrace. See #471 and #482.
+
+### Smaller fixes
+
+* Accept events that do not specify a platform, see #474.
+* Remove the broken, Python-specific plain-text event view; the Markdown view remains available, see #473.
+* Only accepted team members can join team projects, and send issue alerts only to accepted, active members, see #481.
+* Hide raw exception details from production error responses when `MINIMIZE_INFORMATION_EXPOSURE` is enabled, see
+  #481.
+* Parse `USE_ADMIN` as a boolean in Docker settings, so values such as `False` no longer enable it, see #481.
+* Clean up minidump files from minidump-only envelopes, see 5b09ae57.
+* Correct the artifact-upload authentication error message to name the expected Bearer scheme, see #488.
+* Update `fastjsonschema` to 2.22, see #476.
+* Simplify development by keeping events in the database instead of an event filestore, see 14f24309.
+* Update development-only Tailwind dependencies and keep pre-commit builds in sync with the lockfile, see 03e33bec and
+  f50c0dd8.
+
+## 2.5.0 (21 July 2026)
+
+### Improved issue grouping
+
+New projects now use a grouping mechanism that ignores variable values such as IDs and IP addresses in exception and
+log messages. This keeps repeated occurrences together more reliably. Grouping mechanisms are now versioned: existing
+projects stay on the previous mechanism until a project-admin opts in, with a 30-day transition period to avoid
+splitting existing issues. See #255, #440, #441, #448 and #451.
+
+If you wish to convert an existing project to the new grouping mechanism, you can do so from the project settings page.
+
+### Issues across projects
+
+The new global issue list lets users triage issues across all projects they can access, including the usual state
+filters and bulk actions. Project and global issue lists can also be sorted by lifetime event count, making the
+highest-impact issues easy to find. The canonical API supports the same event-count ordering. See #190, #260, #457 and
+#469.
+
+### Self-hosted administration
+
+Installations without email delivery can now show invite links for manual sharing. Admins can generate set-password
+links from the command line, users can change their own passwords, and DSNs have copy buttons. Docker deployments can
+also configure `EMAIL_BACKEND` directly, including Django's dummy backend to disable email deliberately. See #78, #247,
+#333, #365, #453 and #456.
+
+### Smaller fixes
+
+* Add Go SDK setup instructions, see #450.
+* Show "many issues" instead of looking empty when an exact project issue count would be too expensive, see #455.
+* Clarify ingest-directory vacuum output and clean up stale minidump ingest files, see #454.
+* Fix Snappea statistics with Django 5.2's UTC handling, link issue tag summaries to filtered events, and shorten long
+  "seen in releases" lists, see #459.
+* Show column numbers in stacktraces, see #414 and #466.
+* Add cleanup of issues whose stored events have all been removed, see #138 and #468.
+* Use consistent page headings across project, team and settings pages, see #467.
+* Update development-only Tailwind dependencies, see c0c8e752.
+* Email delivery now has a configurable hourly limit, defaulting to 60, so repeated alerts cannot quietly monopolize task
+  workers. Recent email failures are surfaced as a system warning. See #458.
+* Users with unaccepted invitations no longer have project, issue or event access. See #437
+* Auth tokens are masked in the list view until explicitly revealed. See #457 and #460.
+* Project names now only need to be unique within a team, so different teams can use natural names such as "Backend" or
+  "API" independently. See #464.
+
+## 2.4.0 (10 July 2026)
+
+### Backwards incompatible changes
+
+Fail to start when `PID_FILE` is configured to be in a directory not owned by the process running gunicorn/snappea
+(typically: the `bugsink` user). The reason for this is: extra defense in depth, as per #174.
+
+Ensure that `PID_FILE` is either `None` (recommended in systemd setups, i.e. recommended in the recommended case) or, if
+you must, in file in a directory "one level deep" (e.g. `/tmp/snappea/snappea.pid` or `{base_path}/snappea/snappea.pid`)
+
+Otherwise you'll get a B108SecurityError ("Target path owned by uid other than me: ...")
+
+See #195, #196
+
+### Security
+
+Fix: prevent DNS rebinding bypasses in outbound webhook protection.
+
+A project admin who controlled webhook DNS responses could make the policy check see an allowed public IP while the
+actual HTTP request connected to a blocked internal destination. Bugsink now pins each webhook send to the validated DNS
+result while preserving normal Host/SNI behavior. See:
+
+https://github.com/bugsink/bugsink/security/advisories/GHSA-w589-2ffr-2prv
+
+### Sparklines / Trends
+
+Project and issue lists now show compact 24h event-volume trends. Sparkline bucket boundaries respect the installation
+timezone, and y-axis labels now use nicer count-oriented steps with a floor of 10 for low-volume charts. See #444,
+#445 and #447.
+
+### Issue resolution
+
+Resolved issues can be reopened manually. The Resolve controls also support a plain "Resolve" flow and resolve-by-current
+release when observations already exist. See #431 and #436.
+
+### Smaller fixes
+
+* Fix AuthToken description edits applying to the wrong token, see #424.
+* Use the ready endpoint in the sample Compose healthcheck, see #426.
+* Reduce Docker image size, see #430.
+* Improve invalid payload handling in envelope and deprecated `/store/` ingest paths, see #435.
+
+## 2.3.1 (30 June 2026)
+
+* Decode percent-encoded components from `DATABASE_URL` after parsing (See #423)
+* Return 404 for malformed API lookups (in markdown view)
+
+## 2.3.0 (23 June 2026)
+
+### CSP reports
+
+Add native support for CSP violation reports via a new `/api/<project_pk>/security/` endpoint, compatible with the
+`report-uri` directive browsers emit. Reports are translated into events and pushed through the existing envelope
+pipeline, grouped by `(effective-directive, blocked-uri)`, see #371.
+
+### Sparklines
+
+Issue event pages now show a 28-day event-volume sparkline. The sparkline is backed by hourly event-count buckets, so
+regular page views do not need to rescan the event table. Bars can be clicked to jump to an event in that time bucket,
+see #417 and #420.
+
+### Smaller fixes
+
+* Show full exception values on stacktrace pages, see #412.
+* Include Bugsink's Sentry-compatible API surface in the OpenAPI schema, see #413.
+* Return `{"id": ...}` from the `/envelope/` endpoint, see #396.
+* Update the Docker run command in the README, see #415.
 
 ## 2.2.2 (4 June 2026)
 

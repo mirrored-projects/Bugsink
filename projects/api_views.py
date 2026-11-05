@@ -1,15 +1,20 @@
-from django.shortcuts import get_object_or_404
 from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiTypes
 
 from bugsink.api_pagination import AscDescCursorPagination
+from bugsink.api_capabilities import lookup, token_guard
 from bugsink.api_mixins import ExpandViewSetMixin, AtomicRequestMixin
+from events.api_counts import EventCountRangeSerializer, EventCountsSerializer, event_counts_response
+from events.models import ProjectEventCountsPerHour
 
-from .models import Project
+from .models import Project, projects_visible_to_user
 from .serializers import (
     ProjectListSerializer,
     ProjectDetailSerializer,
-    ProjectCreateUpdateSerializer,
+    ProjectCreateSerializer,
+    ProjectUpdateSerializer,
 )
 
 
@@ -26,6 +31,7 @@ class ProjectViewSet(AtomicRequestMixin, ExpandViewSetMixin, viewsets.ModelViewS
     http_method_names = ["get", "post", "patch", "head", "options"]
     pagination_class = ProjectPagination
 
+    @token_guard("projects:read", scopable_by_bound_project=True)
     @extend_schema(
         summary="List projects",
         description="List projects ordered by name.",
@@ -39,18 +45,23 @@ class ProjectViewSet(AtomicRequestMixin, ExpandViewSetMixin, viewsets.ModelViewS
             ),
         ]
     )
-    def list(self, request, *args, **kwargs):
+    def list(self, request, bound_project, *args, **kwargs):
+        self.bound_project = bound_project
         return super().list(request, *args, **kwargs)
 
+    @token_guard("projects:manage", guarding_team=lookup(serializer="team"))
     @extend_schema(
         summary="Create a project",
         description="Create a project. `team` is the team UUID. `visibility` and alert settings are optional.",
-        request=ProjectCreateUpdateSerializer,
-        responses=ProjectCreateUpdateSerializer,
+        request=ProjectCreateSerializer,
+        responses=ProjectCreateSerializer,
     )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+    def create(self, request, serializer, team, *args, **kwargs):
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=201, headers=headers)
 
+    @token_guard("projects:read", guarding_project=lookup(url="pk"))
     @extend_schema(
         summary="Retrieve a project",
         description="Retrieve a project by integer project ID. Use `expand=team` to include the team object.",
@@ -66,17 +77,36 @@ class ProjectViewSet(AtomicRequestMixin, ExpandViewSetMixin, viewsets.ModelViewS
         ],
         responses=ProjectDetailSerializer,
     )
-    def retrieve(self, request, *args, **kwargs):
-        return super().retrieve(request, *args, **kwargs)
+    def retrieve(self, request, project, *args, **kwargs):
+        return Response(self.get_serializer(project).data)
 
+    @token_guard("projects:read", guarding_project=lookup(url="pk"))
+    @extend_schema(
+        summary="Retrieve project event counts",
+        description=(
+            "Hourly counts by digest time, including evicted events. Empty hours have count zero. "
+            "Defaults to 24 hours, including the incomplete current hour. "
+            "Ranges must use UTC hour boundaries and fall within the last 90 days."
+        ),
+        parameters=[EventCountRangeSerializer],
+        responses=EventCountsSerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="event-counts", pagination_class=None)
+    def event_counts(self, request, project, pk=None):
+        return event_counts_response(ProjectEventCountsPerHour.objects.filter(project=project), request.query_params)
+
+    @token_guard("projects:manage", guarding_project=lookup(url="pk"))
     @extend_schema(
         summary="Update a project",
         description="Partially update a project by integer project ID.",
-        request=ProjectCreateUpdateSerializer,
-        responses=ProjectCreateUpdateSerializer,
+        request=ProjectUpdateSerializer,
+        responses=ProjectUpdateSerializer,
     )
-    def partial_update(self, request, *args, **kwargs):
-        return super().partial_update(request, *args, **kwargs)
+    def partial_update(self, request, project, *args, **kwargs):
+        serializer = self.get_serializer(project, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
     def filter_queryset(self, queryset):
         if self.action != "list":
@@ -85,6 +115,10 @@ class ProjectViewSet(AtomicRequestMixin, ExpandViewSetMixin, viewsets.ModelViewS
 
         # Hide soft-deleted in lists
         qs = queryset.filter(is_deleted=False)
+        if self.bound_project is not None:
+            qs = qs.filter(pk=self.bound_project.pk)
+        if self.request.auth.is_user_bound:
+            qs = projects_visible_to_user(qs, self.request.auth.user)
 
         # Optional team filter (no hard requirement; avoids guessing UI rules)
         team_id = query_params.get("team")
@@ -93,18 +127,11 @@ class ProjectViewSet(AtomicRequestMixin, ExpandViewSetMixin, viewsets.ModelViewS
 
         return qs
 
-    def get_object(self):
-        # Pure PK lookup (bypass filter_queryset)
-        # NOTE: alternatively, we just complain hard when a filter is applied to a detail view.
-        queryset = self.get_queryset()
-        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
-        obj = get_object_or_404(queryset, **{self.lookup_field: self.kwargs[lookup_url_kwarg]})
-        self.check_object_permissions(self.request, obj)
-        return obj
-
     def get_serializer_class(self):
-        if self.action in ("create", "partial_update"):
-            return ProjectCreateUpdateSerializer
+        if self.action == "create":
+            return ProjectCreateSerializer
+        if self.action == "partial_update":
+            return ProjectUpdateSerializer
         if self.action == "retrieve":
             return ProjectDetailSerializer
         return ProjectListSerializer

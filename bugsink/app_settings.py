@@ -71,6 +71,9 @@ DEFAULTS = {
     "MAX_EVENTS_PER_HOUR": 5_000,
     "MAX_EVENTS_PER_MONTH": 1_000_000,
 
+    # Sending more than 1 email per minute sustained is self-spam territory, and should require explicit configuration.
+    # Extra benefit of this default: it avoids hogging Snappea workers accidentally.
+    "MAX_EMAILS_PER_HOUR": 60,
     "MAX_EMAILS_PER_MONTH": None,  # None means "no limit"; for non-None values, the quota is per calendar month
 
     "MAX_RETENTION_PER_PROJECT_EVENT_COUNT": None,  # None means "no limit"
@@ -78,6 +81,9 @@ DEFAULTS = {
     "MAX_EVENT_AGE_DAYS": None,  # None means "disabled"
     "MAX_STORED_FILE_COUNT": None,  # None means "no max"
     "MAX_STORED_FILE_BYTES": None,  # None means "no max"
+
+    # Max decompressed size of a single source file in a source bundle.
+    "MAX_SOURCE_CONTEXT_FILE_SIZE": 10 * _MEBIBYTE,
 
     # I don't think Sentry specifies this one, but we do: given the spec 8KiB should be enough by an order of magnitude.
     "MAX_HEADER_SIZE": 8 * _KIBIBYTE,
@@ -105,7 +111,12 @@ DEFAULTS = {
     "ALERTS_WEBHOOK_DENY_NON_GLOBAL": True,
 
     # Feature flags:
+    "FEATURE_BROTLI": True,
     "FEATURE_MINIDUMPS": False,  # minidumps are experimental/early-stage and likely a DOS-magnet; disabled by default
+
+    # Private/undocumented extension API:
+    "EXTRA_URLCONF_MODULES": [],
+    "SYSTEM_WARNING_PROVIDERS": [],
 }
 
 

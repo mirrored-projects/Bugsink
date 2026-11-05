@@ -13,8 +13,9 @@ from bugsink.app_settings import get_settings
 from bugsink.transaction import delay_on_commit
 
 from compat.dsn import build_dsn
+from issues.grouping_mechanisms import GROUPING_MECHANISM_CHOICES, CURRENT_GROUPING_MECHANISM
 
-from teams.models import TeamMembership
+from teams.models import TeamMembership, TeamRole, user_is_team_admin
 
 from .tasks import delete_project_deps
 
@@ -42,7 +43,7 @@ from .tasks import delete_project_deps
 # Some open ends/ choices to be made:
 #
 # * team admin role: should it be inherited on the project level? My sense is "yes", and this is implemented in
-#     `_check_project_admin` but not in the templates.
+#     `user_is_project_admin` but not in the templates.
 # * team admins currently have the ability to see projects, diverging from the "explicitly opted into" rule. Makes some
 #       sense, but could be an argument for the general "allow access" option mentioned above.
 # * if there are very many generally visible teams/projects, some more means of organisation may be needed (search?).
@@ -80,7 +81,7 @@ class Project(models.Model):
 
     team = models.ForeignKey("teams.Team", blank=False, null=True, on_delete=models.SET_NULL)
 
-    name = models.CharField(pgettext_lazy("Project", "Name"), max_length=255, blank=False, null=False, unique=True)
+    name = models.CharField(pgettext_lazy("Project", "Name"), max_length=255, blank=False, null=False)
     slug = models.SlugField(max_length=50, blank=False, null=False, unique=True)
     is_deleted = models.BooleanField(default=False)
 
@@ -124,6 +125,20 @@ class Project(models.Model):
 
     # retention
     retention_max_event_count = models.PositiveIntegerField(_("Retention max event count"), default=10_000)
+
+    # grouping policy
+    grouping_mechanism = models.CharField(
+        max_length=64,
+        choices=GROUPING_MECHANISM_CHOICES,
+        default=CURRENT_GROUPING_MECHANISM,
+    )
+    previous_grouping_mechanism = models.CharField(
+        max_length=64,
+        choices=GROUPING_MECHANISM_CHOICES,
+        blank=True,
+        null=True,
+    )
+    grouping_mechanism_upgraded_at = models.DateTimeField(blank=True, null=True)
 
     def __str__(self):
         return self.name
@@ -173,7 +188,7 @@ class Project(models.Model):
         if user is not None:
             # take the user's team membership into account
             try:
-                TeamMembership.objects.get(team=self.team, user=user)
+                TeamMembership.objects.get(team=self.team, user=user, accepted=True)
                 return True
             except TeamMembership.DoesNotExist:
                 pass
@@ -185,8 +200,8 @@ class Project(models.Model):
 
     def get_warnings(self):
         now = datetime.now(timezone.utc)
-        from ingest.views import BaseIngestAPIView
-        if BaseIngestAPIView.is_quota_still_exceeded(self, now):
+        from ingest.digestion import is_quota_still_exceeded
+        if is_quota_still_exceeded(self, now):
             period_name, nr_of_periods, gte_threshold = json.loads(self.quota_exceeded_reason)
             # TODO i18n
             per_fmt = "%s %ss" % (nr_of_periods, period_name) if nr_of_periods != 1 else period_name
@@ -199,6 +214,9 @@ class Project(models.Model):
     class Meta:
         indexes = [
             models.Index(fields=["name"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["team", "name"], name="unique_project_name_per_team"),
         ]
 
 
@@ -219,3 +237,52 @@ class ProjectMembership(models.Model):
 
     def is_admin(self):
         return self.role == ProjectRole.ADMIN
+
+
+def user_is_project_admin(user, project):
+    return (
+        user.is_superuser
+        or ProjectMembership.objects.filter(
+            project=project,
+            user=user,
+            role=ProjectRole.ADMIN,
+            accepted=True,
+        ).exists()
+        or user_is_team_admin(user, project.team)
+    )
+
+
+def projects_visible_to_user(queryset, user):
+    queryset = queryset.filter(is_deleted=False)
+    if user.is_superuser:
+        return queryset
+    return queryset.filter(
+        models.Q(projectmembership__user=user)
+        | models.Q(team__teammembership__user=user, team__teammembership__accepted=True)
+        | models.Q(visibility__lt=ProjectVisibility.TEAM_MEMBERS)
+    ).distinct()
+
+
+def user_can_create_project(user):
+    return (
+        user.is_superuser
+        or TeamMembership.objects.filter(user=user, role=TeamRole.ADMIN).exists()
+    )
+
+
+def get_issue_accessible_project_ids(user):
+    if user.is_superuser:
+        return list(Project.objects.filter(is_deleted=False).values_list("id", flat=True))
+
+    # See Visibility/Access-design above: issue access requires explicit project membership.
+    return list(
+        ProjectMembership.objects.filter(
+            user=user, accepted=True, project__is_deleted=False).values_list("project_id", flat=True))
+
+
+def user_has_project_membership_access(user, project):
+    if user.is_superuser:
+        return True
+
+    # See Visibility/Access-design above: issue access requires explicit project membership.
+    return ProjectMembership.objects.filter(project=project, user=user, accepted=True).exists()

@@ -1,10 +1,9 @@
 import json
 from datetime import timedelta
 
-from django.shortcuts import render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.db import models
-from django.shortcuts import redirect
-from django.http import Http404, HttpResponseRedirect
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.core.exceptions import PermissionDenied
 from django.contrib.auth import get_user_model
 from django.contrib import messages
@@ -12,19 +11,30 @@ from django.contrib.auth import logout
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.http import require_GET
 
 from users.models import EmailVerification
 from teams.models import TeamMembership, Team, TeamRole
 
 from bugsink.app_settings import get_settings, CB_ANYBODY, CB_MEMBERS, CB_ADMINS
 from bugsink.decorators import login_exempt, atomic_for_request_method
-from bugsink.utils import assert_
+from bugsink.invite_links import email_not_sent_invite_link_notice, manual_invite_link_notice
+from bugsink.utils import assert_, email_backend_delivers_mail
 
 from alerts.models import MessagingServiceConfig, get_alert_service_backend_class, get_alert_service_kind_choices
 from alerts.forms import MessagingServiceConfigNewForm, MessagingServiceConfigEditForm
+from events.sparklines import get_project_list_event_sparklines
 from phonehome.utils import phone_home
 
-from .models import Project, ProjectMembership, ProjectRole, ProjectVisibility
+from .models import (
+    Project,
+    ProjectMembership,
+    ProjectRole,
+    projects_visible_to_user,
+    user_can_create_project,
+    user_has_project_membership_access,
+    user_is_project_admin,
+)
 from .forms import ProjectMembershipForm, MyProjectMembershipForm, ProjectMemberInviteForm, ProjectForm
 from .tasks import send_project_invite_email, send_project_invite_email_new_user
 
@@ -37,32 +47,24 @@ OPEN_ISSUE_COUNT_SHOW_THRESHOLD = 25_000
 @atomic_for_request_method
 def project_list(request, ownership_filter=None):
     my_memberships = ProjectMembership.objects.filter(user=request.user)
+    visible_projects = projects_visible_to_user(Project.objects.all(), request.user)
 
     # using `id__in` here to ensure the counts later on is not restricted to our own memberships (at most 1)
-    my_projects = Project.objects.filter(
-        id__in=ProjectMembership.objects.filter(user=request.user).values('project_id'), is_deleted=False) \
+    my_projects = visible_projects.filter(
+        id__in=ProjectMembership.objects.filter(user=request.user).values('project_id')) \
         .order_by('name').distinct()
 
     my_teams_projects = \
-        Project.objects \
-        .filter(team_id__in=TeamMembership.objects.filter(user=request.user).values('team_id'), is_deleted=False) \
+        visible_projects \
+        .filter(
+            team_id__in=TeamMembership.objects.filter(user=request.user, accepted=True).values('team_id')) \
         .exclude(projectmembership__in=my_memberships) \
         .order_by('name').distinct()
 
-    if request.user.is_superuser:
-        # superusers can see all projects, even hidden ones
-        other_projects = Project.objects \
-            .filter(is_deleted=False) \
-            .exclude(id__in=ProjectMembership.objects.filter(user=request.user).values('project_id')) \
-            .exclude(team_id__in=TeamMembership.objects.filter(user=request.user).values('team_id')) \
-            .order_by('name').distinct()
-    else:
-        other_projects = Project.objects \
-            .filter(is_deleted=False) \
-            .exclude(id__in=ProjectMembership.objects.filter(user=request.user).values('project_id')) \
-            .exclude(team_id__in=TeamMembership.objects.filter(user=request.user).values('team_id')) \
-            .exclude(visibility=ProjectVisibility.TEAM_MEMBERS) \
-            .order_by('name').distinct()
+    other_projects = visible_projects \
+        .exclude(id__in=ProjectMembership.objects.filter(user=request.user).values('project_id')) \
+        .exclude(team_id__in=TeamMembership.objects.filter(user=request.user, accepted=True).values('team_id')) \
+        .order_by('name').distinct()
 
     if ownership_filter is None:
         if my_projects.exists():
@@ -123,6 +125,10 @@ def project_list(request, ownership_filter=None):
         for project in projects_for_open_counts:
             project.open_issue_count = open_counts_by_project_id.get(project.id, 0)
 
+    project_sparklines = get_project_list_event_sparklines([project.id for project in project_list], timezone.now())
+    for project in project_list:
+        project.list_sparkline = project_sparklines[project.id]
+
     if ownership_filter == "mine":
         # Perhaps there's some Django-native way of doing this, but I can't figure it out soon enough, and this also
         # works:
@@ -135,8 +141,7 @@ def project_list(request, ownership_filter=None):
         project_list = project_list_2
 
     return render(request, 'projects/project_list.html', {
-        'can_create':
-            request.user.is_superuser or TeamMembership.objects.filter(user=request.user, role=TeamRole.ADMIN).exists(),
+        'can_create': user_can_create_project(request.user),
         'ownership_filter': ownership_filter,
         'project_list': project_list,
     })
@@ -144,8 +149,7 @@ def project_list(request, ownership_filter=None):
 
 @atomic_for_request_method
 def project_new(request):
-    if not (request.user.is_superuser or TeamMembership.objects.filter(user=request.user,
-            role=TeamRole.ADMIN).exists()):
+    if not user_can_create_project(request.user):
         raise PermissionDenied("You need to be a team admin to create a project")
 
     if get_settings().SINGLE_TEAM and Team.objects.count() == 0:
@@ -177,10 +181,7 @@ def project_new(request):
 
 
 def _check_project_admin(project, user):
-    if not user.is_superuser and \
-       not ProjectMembership.objects.filter(
-            project=project, user=user, role=ProjectRole.ADMIN, accepted=True).exists() and \
-       not TeamMembership.objects.filter(team=project.team, user=user, role=TeamRole.ADMIN, accepted=True).exists():
+    if not user_is_project_admin(user, project):
         raise PermissionDenied("You are not an admin of this project")
 
 
@@ -195,11 +196,7 @@ def project_edit(request, project_pk):
 
         if action == 'delete':
             # Double-check that the user is an admin or superuser
-            if (not request.user.is_superuser
-                and not ProjectMembership.objects.filter(
-                    project=project, user=request.user, role=ProjectRole.ADMIN, accepted=True).exists()
-                and not TeamMembership.objects.filter(
-                    team=project.team, user=request.user, role=TeamRole.ADMIN, accepted=True).exists()):
+            if not user_is_project_admin(request.user, project):
                 raise PermissionDenied("Only project or team admins can delete projects")
 
             # Delete the project
@@ -226,20 +223,37 @@ def project_edit(request, project_pk):
 def project_members(request, project_pk):
     project = Project.objects.get(id=project_pk, is_deleted=False)
     _check_project_admin(project, request.user)
+    invite_link_notice = None
 
     if request.method == 'POST':
         full_action_str = request.POST.get('action')
         action, user_id = full_action_str.split(":", 1)
         if action == "remove":
             ProjectMembership.objects.filter(project=project_pk, user=user_id).delete()
-        elif action == "reinvite":
+        elif action == "copy_invite_link" and not email_backend_delivers_mail():
+            membership = get_object_or_404(
+                ProjectMembership.objects.select_related("user"),
+                project=project, user_id=user_id, accepted=False)
+            invite_link = _create_project_invite_link(
+                membership.user, project_pk, create_account_setup_link=False)
+            if invite_link is None:
+                raise PermissionDenied("Cannot show an account setup link for an existing inactive user")
+            invite_link_notice = manual_invite_link_notice(invite_link, membership.user.email)
+        elif action == "reinvite" and email_backend_delivers_mail():
             user = User.objects.get(id=user_id)
             _send_project_invite_email(user, project_pk)
             messages.success(request, f"Invitation resent to {user.email}")
 
+    return _render_project_members(request, project, invite_link_notice)
+
+
+def _render_project_members(request, project, invite_link_notice=None):
     return render(request, 'projects/project_members.html', {
         'project': project,
         'members': project.projectmembership_set.all().select_related('user'),
+        'can_send_invites': email_backend_delivers_mail(),
+        'can_copy_invite_links': not email_backend_delivers_mail(),
+        'invite_link_notice': invite_link_notice,
     })
 
 
@@ -252,6 +266,20 @@ def _send_project_invite_email(user, project_pk):
         # not yet accepted the invite. In the latter case, we just send a fresh email
         verification = EmailVerification.objects.create(user=user, email=user.username)
         send_project_invite_email_new_user.delay(user.email, project_pk, verification.token)
+
+
+def _create_project_invite_link(user, project_pk, create_account_setup_link):
+    if user.is_active:
+        return get_settings().BASE_URL + reverse("project_members_accept", kwargs={"project_pk": project_pk})
+
+    if not create_account_setup_link:
+        return None
+
+    verification = EmailVerification.objects.create(user=user, email=user.username)
+    return get_settings().BASE_URL + reverse("project_members_accept_new_user", kwargs={
+        "project_pk": project_pk,
+        "token": verification.token,
+    })
 
 
 @atomic_for_request_method
@@ -281,18 +309,42 @@ def project_members_invite(request, project_pk):
             user, user_created = User.objects.get_or_create(
                 email=email, defaults={'username': email, 'is_active': False})
 
-            _send_project_invite_email(user, project_pk)
+            if email_backend_delivers_mail():
+                _send_project_invite_email(user, project_pk)
+                invite_link = None
+            else:
+                invite_link = _create_project_invite_link(
+                    user, project_pk, create_account_setup_link=user_created)
 
             _, membership_created = ProjectMembership.objects.get_or_create(project=project, user=user, defaults={
                 'role': form.cleaned_data['role'],
                 'accepted': False,
             })
 
+            if invite_link is not None:
+                invite_link_notice = email_not_sent_invite_link_notice(invite_link, user.email)
+                form = ProjectMemberInviteForm(user_must_exist)
+                if request.POST.get('action') == "invite_and_add_another":
+                    return render(request, 'projects/project_members_invite.html', {
+                        'project': project,
+                        'form': form,
+                        'invite_link_notice': invite_link_notice,
+                    })
+                return _render_project_members(request, project, invite_link_notice)
+
             if membership_created:
-                messages.success(request, f"Invitation sent to {email}")
+                if email_backend_delivers_mail():
+                    messages.success(request, f"Invitation sent to {email}")
+                else:
+                    messages.success(
+                        request, f"Invitation created for {email}, but no email was sent because email is not set up.")
             else:
-                messages.success(
-                    request, f"Invitation resent to {email} (it was previously sent and we just sent it again)")
+                if email_backend_delivers_mail():
+                    messages.success(
+                        request, f"Invitation resent to {email} (it was previously sent and we just sent it again)")
+                else:
+                    messages.success(request, (
+                        f"Invitation already exists for {email}, but no email was sent because email is not set up."))
 
             if request.POST.get('action') == "invite_and_add_another":
                 return redirect('project_members_invite', project_pk=project_pk)
@@ -361,7 +413,8 @@ def project_members_accept_new_user(request, project_pk, token):
     # clean up expired tokens; doing this on every request is just fine, it saves us from having to run a cron
     # job-like thing
     EmailVerification.objects.filter(
-        created_at__lt=timezone.now() - timedelta(get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
+        created_at__lt=timezone.now() - timedelta(
+            seconds=get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
 
     try:
         verification = EmailVerification.objects.get(token=token)
@@ -433,14 +486,13 @@ def project_members_accept(request, project_pk):
 def project_sdk_setup(request, project_pk, platform=""):
     project = Project.objects.get(id=project_pk, is_deleted=False)
 
-    if not request.user.is_superuser and not ProjectMembership.objects.filter(project=project, user=request.user,
-                                                                              accepted=True).exists():
+    if not user_has_project_membership_access(request.user, project):
         raise PermissionDenied("You are not a member of this project")
 
     # NOTE about lexers:: I have bugsink/pyments_extensions; but the platforms mentioned there don't necessarily map to
     # what I will make selectable here. "We'll see" whether yet another lookup dict will be needed.
 
-    assert_(platform in ["", "python", "javascript", "php"])
+    assert_(platform in ["", "python", "javascript", "php", "go"])
 
     template_name = "projects/project_sdk_setup%s.html" % ("_" + platform if platform else "")
 
@@ -448,6 +500,17 @@ def project_sdk_setup(request, project_pk, platform=""):
         "project": project,
         "dsn": project.dsn,
     })
+
+
+@require_GET
+@atomic_for_request_method
+def project_sdk_setup_status(request, project_pk):
+    project = Project.objects.get(id=project_pk, is_deleted=False)
+
+    if not user_has_project_membership_access(request.user, project):
+        raise PermissionDenied("You are not a member of this project")
+
+    return JsonResponse({"digested_event_count": project.digested_event_count})
 
 
 @atomic_for_request_method

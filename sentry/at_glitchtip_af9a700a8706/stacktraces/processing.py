@@ -1,0 +1,56 @@
+# changed by Bugsink: Mapping is used below to recognize frames in unnormalized event data.
+from collections.abc import Mapping
+
+from sentry.at_glitchtip_af9a700a8706.stacktraces.functions import get_function_name_for_frame
+from sentry.at_glitchtip_af9a700a8706.utils.safe import get_path
+
+
+def _as_frame_sequence(value):
+    # changed by Bugsink: unlike Sentry, Bugsink may process event data that has not been normalized by Relay.
+    return value if isinstance(value, (list, tuple)) else None
+
+
+def get_crash_frame_from_event_data(data, frame_filter=None):
+    from issues.grouping_mechanisms.building_blocks.v1 import get_values  # changed by Bugsink
+    values = get_values(get_path(data, "exception"))
+
+    # changed by Bugsink: check candidates separately so malformed exception frames do not hide a valid fallback.
+    frames = (
+        _as_frame_sequence(get_path(values, -1, "stacktrace", "frames"))
+        or _as_frame_sequence(get_path(data, "stacktrace", "frames"))
+    )
+    if not frames:
+        threads = get_values(get_path(data, "threads"))
+        if threads and len(threads) == 1:
+            # changed by Bugsink: only pass a frame sequence into the selection loop.
+            frames = _as_frame_sequence(get_path(threads, 0, "stacktrace", "frames"))
+
+    default = None
+    for frame in reversed(frames or ()):
+        # changed by Bugsink: skip malformed frame items before the filter or other dictionary access.
+        if not isinstance(frame, Mapping):
+            continue
+        if frame_filter is not None:
+            if not frame_filter(frame):
+                continue
+        if frame.get("in_app"):
+            return frame
+        if default is None:
+            default = frame
+
+    if default:
+        return default
+
+
+def get_crash_location(data):
+    # This function lives in a different file in the Sentry codebase (sentry/eventtypes/error.py), but it made its way
+    # here because that file didn't make it to the part of Sentry that we vendored.
+
+    frame = get_crash_frame_from_event_data(
+        data,
+        frame_filter=lambda x: x.get("function") not in (None, "<redacted>", "<unknown>"),
+    )
+    if frame is not None:
+        func = get_function_name_for_frame(frame, data.get("platform"))
+        return frame.get("filename") or frame.get("abs_path"), func
+    return None, None

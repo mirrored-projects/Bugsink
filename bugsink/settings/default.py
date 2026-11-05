@@ -78,7 +78,8 @@ REST_FRAMEWORK = {
         "bugsink.authentication.BearerTokenAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        "bugsink.permissions.IsGlobalAuthenticated",
+        "bugsink.permissions.IsAuthTokenAuthenticated",
+        "bugsink.permissions.HasRequiredCapability",
     ],
 
     "DEFAULT_RENDERER_CLASSES": [
@@ -100,12 +101,15 @@ SPECTACULAR_SETTINGS = {
         {"bearerAuth": []}
     ],
     "ENUM_NAME_OVERRIDES": {
+        "GroupingKeyMechanismEnum": "issues.grouping_mechanisms.GROUPING_CHOICES",
+        "GroupingMechanismEnum": "issues.grouping_mechanisms.GROUPING_MECHANISM_CHOICES",
         "TeamVisibilityEnum": ["joinable", "discoverable", "hidden"],
         "ProjectVisibilityEnum": ["joinable", "discoverable", "team_members"],
     },
     "POSTPROCESSING_HOOKS": [
         "drf_spectacular.hooks.postprocess_schema_enums",
         "bugsink.api_schema.add_sentry_compatible_api",
+        "bugsink.api_schema.add_capability_documentation",
     ],
 }
 
@@ -136,6 +140,12 @@ AUTH_USER_MODEL = "users.User"
 TAILWIND_APP_NAME = 'theme'
 
 MIDDLEWARE = [
+    # NOTE: _most_ useful while building Bugsink; in the singleserver production setup the timings/counts of this
+    # middleware are not logged to a visible location; and this feature is undocumented. However, it _could_ prove
+    # useful in such contexts too, so I'm not going to put it behind a conditional. It comes first so that its timing
+    # and query count cover the full middleware chain.
+    'bugsink.middleware.PerformanceStatsMiddleware',
+
     "bugsink.middleware.ContentEncodingCheckMiddleware",
     'bugsink.middleware.SetRemoteAddrMiddleware',
     'bugsink.middleware.DisallowChunkedMiddleware',
@@ -155,11 +165,6 @@ MIDDLEWARE = [
 
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-
-    # NOTE: _most_ useful while building Bugsink; in the singleserver production setup the timings/counts of this
-    # middleware are not logged to a visible location; and this feature is undocumented. However, it _could_ prove
-    # useful in such contexts too, so I'm not going to put it behind a conditional.
-    'bugsink.middleware.PerformanceStatsMiddleware',
 ]
 
 # Config of verbose_csrf_middleware.CsrfViewMiddleware: For Bugsink, there's never any intentional cross-scheme POSTing

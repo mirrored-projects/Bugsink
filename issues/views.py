@@ -14,7 +14,7 @@ from django.db.utils import OperationalError
 from django.conf import settings
 from django.utils.functional import cached_property
 
-from sentry.utils.safe import get_path
+from sentry.at_glitchtip_af9a700a8706.utils.safe import get_path
 from sentry_sdk_extensions import capture_or_log_exception
 
 from bugsink.decorators import project_membership_required, issue_membership_required, atomic_for_request_method
@@ -24,9 +24,10 @@ from bugsink.utils import assert_
 from phonehome.utils import phone_home
 
 from events.models import Event
+from events.sparklines import get_issue_event_sparkline, get_issue_list_event_sparklines
 from events.ua_stuff import get_contexts_enriched_with_ua
 
-from projects.models import ProjectMembership
+from projects.models import ProjectMembership, get_issue_accessible_project_ids
 from tags.search import search_issues, search_events, search_events_optimized
 from theme.templatetags.issues import timestamp_with_millis
 
@@ -35,8 +36,15 @@ from .models import (
     apply_issue_action, is_valid_issue_action, q_for_invalid_issue_action)
 from .forms import CommentForm
 from .utils import get_values, get_main_exception
-from events.utils import annotate_with_meta, apply_sourcemaps, get_sourcemap_images
+from events.utils import (
+    annotate_with_meta,
+    apply_sourcemaps,
+    get_sourcemap_images,
+    get_stacktrace_entries,
+    get_thread_stacktrace_entries,
+)
 from .markdown_issue import render_issue_md
+from .grouping_mechanisms import GROUPING_MECHANISMS, MECHANISM_INDEPENDENT_GROUPING
 
 logger = logging.getLogger("bugsink.issues")
 
@@ -55,6 +63,11 @@ GLOBAL_MUTE_OPTIONS = [
     MuteOption("until", "hour", 24, 5),
     MuteOption("until", "hour", 24, 100),
 ]
+
+ISSUE_LIST_SORTS = {
+    "last_seen": ("-last_seen",),
+    "events": ("-digested_event_count", "-last_seen"),
+}
 
 
 class EagerPaginator(Paginator):
@@ -141,6 +154,14 @@ def issue_list(request, project_pk, state_filter="open"):
         return _issue_list_pt_2(request, project, state_filter, unapplied_issue_ids)
 
 
+@phone_home
+def global_issue_list(request, state_filter="open"):
+    # The global list mirrors issue_list's split between the write part and pure display reads.
+    accessible_project_ids, unapplied_issue_ids = _global_issue_list_pt_1(request, state_filter=state_filter)
+    with durable_atomic():
+        return _global_issue_list_pt_2(request, accessible_project_ids, state_filter, unapplied_issue_ids)
+
+
 @atomic_for_request_method
 @project_membership_required
 def _issue_list_pt_1(request, project, state_filter="open"):
@@ -161,18 +182,54 @@ def _issue_list_pt_1(request, project, state_filter="open"):
     return project, unapplied_issue_ids
 
 
-def _issue_list_pt_2(request, project, state_filter, unapplied_issue_ids):
+@atomic_for_request_method
+def _global_issue_list_pt_1(request, state_filter="open"):
+    accessible_project_ids = get_issue_accessible_project_ids(request.user)
+
+    if request.method == "POST":
+        action = request.POST["action"]
+        if action.startswith("resolved_"):
+            raise PermissionDenied("Release-specific issue actions are project-scoped")
+
+        issue_ids = request.POST.getlist('issue_ids[]')
+        issue_qs = Issue.objects.filter(
+            project_id__in=accessible_project_ids, is_deleted=False, pk__in=issue_ids)
+        illegal_conditions = q_for_invalid_issue_action(action)
+        # list() is necessary because we need to evaluate the qs before any actions are actually applied (if we don't,
+        # actions are always marked as illegal, because they are applied first, then checked (and applying twice is
+        # illegal)
+        unapplied_issue_ids = list(issue_qs.filter(illegal_conditions).values_list("id", flat=True))
+        apply_issue_action(IssueQuerysetStateManager, issue_qs.exclude(illegal_conditions), action, request.user)
+
+    else:
+        unapplied_issue_ids = None
+
+    return accessible_project_ids, unapplied_issue_ids
+
+
+def _filter_issue_list_by_state(issue_list, state_filter):
     d_state_filter = {
         "open": lambda qs: qs.filter(is_resolved=False, is_muted=False),
         "unresolved": lambda qs: qs.filter(is_resolved=False),
-        "resolved": lambda qs: qs.filter(is_resolved=True),
-        "muted": lambda qs: qs.filter(is_muted=True),
+        "resolved": lambda qs: qs.filter(is_resolved=True, is_muted=False),
+        "muted": lambda qs: qs.filter(is_resolved=False, is_muted=True),
         "all": lambda qs: qs,
     }
 
-    issue_list = d_state_filter[state_filter](
-        Issue.objects.filter(project=project, is_deleted=False)
-    ).order_by("-last_seen")
+    return d_state_filter[state_filter](issue_list)
+
+
+def _get_issue_list_sort(request):
+    sort = request.GET.get("sort", "last_seen")
+    return sort if sort in ISSUE_LIST_SORTS else "last_seen"
+
+
+def _issue_list_pt_2(request, project, state_filter, unapplied_issue_ids):
+    sort = _get_issue_list_sort(request)
+    issue_list = _filter_issue_list_by_state(
+        Issue.objects.filter(project=project, is_deleted=False),
+        state_filter,
+    ).order_by(*ISSUE_LIST_SORTS[sort])
 
     if request.GET.get("q"):
         issue_list = search_issues(project, issue_list, request.GET["q"])
@@ -180,6 +237,10 @@ def _issue_list_pt_2(request, project, state_filter, unapplied_issue_ids):
     paginator = UncountablePaginator(issue_list, 250)
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
+    issue_sparklines = get_issue_list_event_sparklines(
+        [issue.id for issue in page_obj.object_list], timezone.now(), project.id)
+    for issue in page_obj.object_list:
+        issue.list_sparkline = issue_sparklines[issue.id]
 
     try:
         member = ProjectMembership.objects.get(project=project, user=request.user)
@@ -200,6 +261,42 @@ def _issue_list_pt_2(request, project, state_filter, unapplied_issue_ids):
         "disable_mute_buttons": state_filter in ("resolved", "muted"),
         "disable_unmute_buttons": state_filter in ("resolved", "open"),
         "q": request.GET.get("q", ""),
+        "sort": sort,
+        "page_obj": page_obj,
+    })
+
+
+def _global_issue_list_pt_2(request, accessible_project_ids, state_filter, unapplied_issue_ids):
+    sort = _get_issue_list_sort(request)
+    issue_list = _filter_issue_list_by_state(
+        Issue.objects.filter(project_id__in=accessible_project_ids, is_deleted=False),
+        state_filter,
+    ).select_related("project").order_by(*ISSUE_LIST_SORTS[sort])
+
+    paginator = UncountablePaginator(issue_list, 250)
+    page_number = request.GET.get("page")
+    page_obj = paginator.get_page(page_number)
+    issue_sparklines = get_issue_list_event_sparklines(
+        [issue.id for issue in page_obj.object_list], timezone.now())
+    for issue in page_obj.object_list:
+        issue.list_sparkline = issue_sparklines[issue.id]
+
+    return render(request, "issues/issue_list.html", {
+        "project": None,
+        "member": None,
+        "is_global_issue_list": True,
+        "state_filter": state_filter,
+        "mute_options": GLOBAL_MUTE_OPTIONS,
+
+        "unapplied_issue_ids": unapplied_issue_ids,
+
+        # design decision: we statically determine some disabledness (i.e. choices that will never make sense are
+        # disallowed), but we don't have any dynamic disabling based on the selected issues.
+        "disable_resolve_buttons": state_filter in ("resolved"),
+        "disable_mute_buttons": state_filter in ("resolved", "muted"),
+        "disable_unmute_buttons": state_filter in ("resolved", "open"),
+        "q": "",
+        "sort": sort,
         "page_obj": page_obj,
     })
 
@@ -286,8 +383,8 @@ def _get_event(qs, issue, event_pk, digest_order, nav, bounds):
             return Event.objects.get(project=issue.project, issue=issue, event_id=event_pk)
 
     elif digest_order is not None:
-        # "ergonomics" when people type this in the URL bar
-        return qs.get(digest_order=digest_order)
+        # used in the clickable sparkline
+        return Event.objects.get(issue=issue, digest_order=digest_order)
     else:
         raise Http404("Either event_pk, nav, or digest_order must be provided")
 
@@ -325,7 +422,13 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
 
     parsed_data = event.get_parsed_data()
 
-    exceptions = get_values(parsed_data["exception"]) if "exception" in parsed_data else None
+    exceptions = get_stacktrace_entries(parsed_data)
+    thread_stacktraces = (
+        get_thread_stacktrace_entries(parsed_data)
+        if exceptions and exceptions[0]["is_exception_stacktrace"] else []
+    )
+    if len(thread_stacktraces) < 2:
+        thread_stacktraces = []
 
     try:
         # get_values for consistency (whether it's needed: unclear, since _meta is not actually in the specs)
@@ -354,20 +457,32 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
     # (possibly later) have this as something that is configurable at the user level.
     stack_of_plates = event.platform != "python"  # Python is the only platform that has chronological stacktraces
 
-    if exceptions is not None and len(exceptions) > 0:
-        if exceptions[-1].get('stacktrace') and exceptions[-1]['stacktrace'].get('frames'):
-            exceptions[-1]['stacktrace']['frames'][-1]['raise_point'] = True
+    if exceptions:
+        is_exception_stacktrace = exceptions[0]["is_exception_stacktrace"]
+        entry_to_mark = exceptions[-1] if is_exception_stacktrace else exceptions[0]
+
+        if entry_to_mark.get('stacktrace') and entry_to_mark['stacktrace'].get('frames'):
+            entry_to_mark['stacktrace']['frames'][-1]['raise_point'] = True
 
         if stack_of_plates:
             # NOTE manipulation of parsed_data going on here, this could be a trap if other parts depend on it
             # (e.g. grouper)
-            exceptions = [e for e in reversed(exceptions)]
+            if is_exception_stacktrace:
+                exceptions = [e for e in reversed(exceptions)]
             for exception in exceptions:
                 if not exception.get('stacktrace'):
                     continue
                 if not exception.get('stacktrace').get('frames'):
                     continue
                 exception['stacktrace']['frames'] = [f for f in reversed(exception['stacktrace']['frames'])]
+
+    if stack_of_plates:
+        for thread in thread_stacktraces:
+            thread["stacktrace"]["frames"] = list(reversed(thread["stacktrace"].get("frames") or []))
+
+    multiple_thread_stacktraces = bool(
+        exceptions and len(exceptions) > 1 and not exceptions[0]["is_exception_stacktrace"]
+    )
 
     return render(request, "issues/stacktrace.html", {
         "tab": "stacktrace",
@@ -380,6 +495,8 @@ def issue_event_stacktrace(request, issue, event_pk=None, digest_order=None, nav
         "request_repr": _request_repr(parsed_data),
         "exceptions": exceptions,
         "stack_of_plates": stack_of_plates,
+        "thread_stacktraces": thread_stacktraces,
+        "multiple_thread_stacktraces": multiple_thread_stacktraces,
         "mute_options": GLOBAL_MUTE_OPTIONS,
         "q": request.GET.get("q", ""),
         # event_qs_count is not used when there is no q, so no need to calculate it in that case
@@ -568,6 +685,12 @@ def issue_event_details(request, issue, event_pk=None, digest_order=None, nav=No
         "event_qs_count": _event_count(request, issue, event_x_qs) if request.GET.get("q") else None,
         "has_prev": event.digest_order > first_do,
         "has_next": event.digest_order < last_do,
+        "issue_sparkline": get_issue_event_sparkline(
+            issue.id,
+            timezone.now(),
+            event.digested_at,
+            search_events(issue.project, issue, request.GET["q"]) if request.GET.get("q") else None,
+        ),
     })
 
 
@@ -629,10 +752,21 @@ def issue_grouping(request, issue):
 
     event_qs = search_events(issue.project, issue, request.GET.get("q", ""))
     last_event = event_qs.order_by("digest_order").last()
+
+    grouping_mechanisms_by_age = [MECHANISM_INDEPENDENT_GROUPING] + [
+        mechanism.identifier for mechanism in reversed(GROUPING_MECHANISMS)
+    ]
+    grouping_order = {mechanism: i for i, mechanism in enumerate(grouping_mechanisms_by_age)}
+    groupers = sorted(
+        issue.grouping_set.all(),
+        key=lambda grouper: (grouping_order.get(grouper.grouping_mechanism, 999), grouper.grouping_key),
+    )
+
     return render(request, "issues/grouping.html", {
         "tab": "grouping",
         "project": issue.project,
         "issue": issue,
+        "groupers": groupers,
         "is_event_page": False,
         "request_repr": _request_repr(last_event.get_parsed_data()) if last_event is not None else "",
         "mute_options": GLOBAL_MUTE_OPTIONS,
@@ -649,19 +783,19 @@ def issue_event_list(request, issue):
     # because we we need _actual events_ for display, and we don't have the regular has_prev/has_next (paginator
     # instead), we don't try to optimize using search_events_optimized in this view (except for counting)
     if "q" in request.GET:
-        event_list = search_events(issue.project, issue, request.GET["q"]).order_by("digest_order")
+        event_list = search_events(issue.project, issue, request.GET["q"]).order_by("-digest_order")
         event_x_qs = search_events_optimized(issue.project, issue, request.GET.get("q", ""))
         # we don't do the `_event_count` optimization here, because we need the correct number for pagination
         paginator = KnownCountPaginator(event_list, 250, count=event_x_qs.count())
     else:
-        event_list = issue.event_set.order_by("digest_order")
+        event_list = issue.event_set.order_by("-digest_order")
         # re 250: in general "big is good" because it allows a lot "at a glance".
         paginator = KnownCountPaginator(event_list, 250, count=issue.stored_event_count)
 
     page_number = request.GET.get("page")
     page_obj = paginator.get_page(page_number)
 
-    last_event = event_list.last()
+    last_event = event_list.first()
 
     return render(request, "issues/event_list.html", {
         "tab": "event-list",

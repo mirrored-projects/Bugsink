@@ -9,7 +9,7 @@ from io import BytesIO, StringIO
 from glob import glob
 from unittest import TestCase as RegularTestCase
 from unittest.mock import patch
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from django.test import TestCase as DjangoTestCase
@@ -27,7 +27,7 @@ from bsmain.management.commands.send_json import Command as SendJsonCommand
 from compat.dsn import get_header_value
 from events.models import Event
 from bsmain.models import AuthToken
-from ingest.views import BaseIngestAPIView
+from ingest.digestion import count_issue_periods_and_act_on_it
 from issues.factories import get_or_create_issue
 from tags.models import store_tags
 from tags.tasks import vacuum_tagvalues
@@ -35,10 +35,10 @@ from events.markdown_stacktrace import render_stacktrace_md
 from files.models import File, FileMetadata
 from events.usage import record_event_counts
 
-from .models import Issue, IssueStateManager, TurningPoint, TurningPointKind
+from .models import (
+    Issue, IssueStateManager, TurningPoint, TurningPointKind)
 from .regressions import is_regression, is_regression_2, issue_is_regression
 from .factories import denormalized_issue_fields
-from .utils import get_issue_grouper_for_data
 from .tasks import get_model_topography_with_issue_override
 
 User = get_user_model()
@@ -114,10 +114,10 @@ class RegressionUtilTestCase(RegularTestCase):
             events_at=["a"],
             current_event_at="b"))
 
-    def test_observations_override_marked_resolutions(self):
-        # if an issue has been marked as resolved but has also (presumably later on) been seen in reality to not have
-        # been resolved, it is not resolved by that release. Hence, re-occurrence is not a (new) regression.
-        self.assertFalse(is_regression(
+    def test_marked_resolutions_override_observations(self):
+        # Marking an issue as resolved in a release where it has already been seen means "resolved as of now".
+        # A later event in that same release is therefore a regression.
+        self.assertTrue(is_regression(
             self.releases,
             fixed_at=["c"],
             events_at=["c"],
@@ -264,6 +264,53 @@ class RegressionIssueTestCase(DjangoTestCase):
         self.assertFalse(issue_is_regression(fresh(issue), "1.0.0"))
         self.assertFalse(issue_is_regression(fresh(issue), "2.0.0"))
 
+    def test_issue_is_regression_with_releases_resolve_by_latest_after_observation(self):
+        project = Project.objects.create()
+        timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        create_release_if_needed(fresh(project), "1.0.0", timestamp)
+        create_release_if_needed(fresh(project), "2.0.0", timestamp)
+
+        issue = Issue.objects.create(
+            project=project,
+            events_at="2.0.0\n",
+            **denormalized_issue_fields(),
+        )
+
+        IssueStateManager.resolve_by_latest(issue)
+        issue.save()
+
+        self.assertFalse(issue_is_regression(fresh(issue), "1.0.0"))
+        self.assertTrue(issue_is_regression(fresh(issue), "2.0.0"))
+
+    def test_issue_is_regression_after_plain_resolve_on_release_project(self):
+        project = Project.objects.create()
+        timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        create_release_if_needed(fresh(project), "1.0.0", timestamp)
+        create_release_if_needed(fresh(project), "1.1.0", timestamp)
+
+        issue = Issue.objects.create(
+            project=project,
+            events_at="1.0.0\n",
+            **denormalized_issue_fields(),
+        )
+
+        # Seen at 1.0, resolved at 1.0.
+        IssueStateManager.resolve_by_release(issue, "1.0.0")
+        issue.save()
+
+        # Seen at 1.1, then resolved without pinning to a release.
+        IssueStateManager.reopen(issue)
+        issue.events_at += "1.1.0\n"
+        IssueStateManager.resolve(issue)
+        issue.save()
+
+        self.assertEqual(fresh(issue).fixed_at, "1.0.0\n")
+        self.assertTrue(fresh(issue).is_resolved_unconditionally)
+        self.assertTrue(issue_is_regression(fresh(issue), "1.0.0"))
+        self.assertTrue(issue_is_regression(fresh(issue), "1.1.0"))
+
     def test_issue_is_regression_with_releases_resolve_by_next(self):
         project = Project.objects.create()
         timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -289,45 +336,19 @@ class RegressionIssueTestCase(DjangoTestCase):
         create_release_if_needed(fresh(project), "4.0.0", timestamp)
         self.assertTrue(issue_is_regression(fresh(issue), "4.0.0"))
 
-
-"""
-Some thoughts on re-opening, that I have to put 'somewhere'; might as well put them here in the tests where I first
-thought of them... The direct cause for these thoughts was that I found it very hard to reason about the following
-question: "what does re-opening an issue mean for the `fixed_at` points?"
-
-First: re-opening an issue (from the UI) is kinda funny in the first place. What are you saying by doing that anyway?
-You're saying "this is an issue that continues to exist, despite me/someone at some point saying that it was resolved".
-You're doing this with "pure brainpower", i.e. by thinking it through rather than waiting for an issue to reoccur
-naturally.
-
-Why would you ever want to do this? My main guess is: to undo a click on resolve that you just did. If that's so, we
-might implement re-open more closely as such an undo (and the anwer to the first question would also follow from it,
-i.e. it would be "the last-added `fixed_at` point should be removed"
-
-The main consequences of re-opening are: you won't be bothered (alerts) about a regression that you just understood to
-still exist. And: if you go looking for unresolved issues, you'll find this one.
-
-Having said all of that, I might do something radical and _not implement reopen in the UI at all!_ Let's see if I run
-into the lack of it existing.
-
-... having said that, it's not _that bad_, and I think I could answer the original question, if pressed (allowing us to
-reintroduce the Reopen button in the UI). I would simply say: let's not bother doing a proper administration of
-`fixed_at` points when the issue is manually reopened. Manually reopening as such allows us to avoid an alert that we
-don't need, and get our administration of not-yet-resolved issues in order. The only scenario where this goes wrong is
-something along these lines:
-
-at some point ("a") which does not have seen breakage we mark as resolved. we then reopen. "a" remains marked as
-resolved, because we're in the "let's not bother" scenario. Then, we get a later point where we first see the issue in
-the wild ("b") and resolve it ("c"). Then, if we were to see it again in "a", as per the test_longer_patterns, this
-would be seen as a regression when in reality it was never solved in "a", and its marking-as-such should probably have
-seen as an undo rather than anything else.
-"""
+        # reopen cancels the "fixed in some future release" claim
+        IssueStateManager.reopen(issue)
+        issue.save()
+        issue = fresh(issue)
+        self.assertFalse(issue.is_resolved)
+        self.assertFalse(issue.is_resolved_by_next_release)
+        self.assertFalse(issue_is_regression(issue, "4.0.0"))
 
 
 class MuteUnmuteTestCase(TransactionTestCase):
     """
     Somewhat of an integration test. The unit-under-test here is the whole of
-    * BaseIngestAPIView.count_issue_periods_and_act_on_it
+    * count_issue_periods_and_act_on_it
     * threshold-counting
     * IssueStateManager.unmute
     """
@@ -374,7 +395,7 @@ class MuteUnmuteTestCase(TransactionTestCase):
         issue.save()
 
         event = create_event(project, issue, project_digest_order=1)
-        BaseIngestAPIView.count_issue_periods_and_act_on_it(issue, event, datetime.now(timezone.utc))
+        count_issue_periods_and_act_on_it(issue, event, datetime.now(timezone.utc))
         issue.save()
 
         self.assertFalse(Issue.objects.get(id=issue.id).is_muted)
@@ -396,7 +417,7 @@ class MuteUnmuteTestCase(TransactionTestCase):
         issue.save()
 
         event = create_event(project, issue, project_digest_order=1)
-        BaseIngestAPIView.count_issue_periods_and_act_on_it(issue, event, datetime.now(timezone.utc))
+        count_issue_periods_and_act_on_it(issue, event, datetime.now(timezone.utc))
         issue.save()
 
         self.assertFalse(Issue.objects.get(id=issue.id).is_muted)
@@ -412,7 +433,7 @@ class ViewTests(TransactionTestCase):
         super().setUp()
         self.user = User.objects.create_user(username='test', password='test')
         self.project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=self.project, user=self.user)
+        ProjectMembership.objects.create(project=self.project, user=self.user, accepted=True)
         self.issue, _ = get_or_create_issue(self.project)
         self.event = create_event(self.project, self.issue, project_digest_order=1)
         self.client.force_login(self.user)
@@ -420,6 +441,46 @@ class ViewTests(TransactionTestCase):
     def test_issue_list_view(self):
         response = self.client.get(f"/issues/{self.project.id}/")
         self.assertContains(response, self.issue.title())
+        self.assertContains(response, self.issue.friendly_id())
+
+    def test_issue_list_sorting(self):
+        other_issue, _ = get_or_create_issue(
+            self.project, create_event_data(exception_type="FrequentError"))
+        now = datetime.now(timezone.utc)
+        Issue.objects.filter(id=self.issue.id).update(last_seen=now, digested_event_count=1)
+        Issue.objects.filter(id=other_issue.id).update(
+            last_seen=now - timedelta(days=1), digested_event_count=10)
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "events"})
+        self.assertEqual([other_issue.id, self.issue.id], [issue.id for issue in response.context["page_obj"]])
+        self.assertContains(response, '<option value="events" selected>')
+        self.assertContains(response, f'href="/issues/{self.project.id}/muted/?sort=events"')
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "last_seen"})
+        self.assertEqual([self.issue.id, other_issue.id], [issue.id for issue in response.context["page_obj"]])
+
+        response = self.client.get(f"/issues/{self.project.id}/", {"sort": "invalid"})
+        self.assertEqual("last_seen", response.context["sort"])
+        self.assertEqual([self.issue.id, other_issue.id], [issue.id for issue in response.context["page_obj"]])
+
+    def test_pending_project_membership_cannot_view_issue_list(self):
+        pending_user = User.objects.create_user(username='pending', password='test')
+        ProjectMembership.objects.create(project=self.project, user=pending_user, accepted=False)
+        self.client.force_login(pending_user)
+
+        response = self.client.get(f"/issues/{self.project.id}/")
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_issue_list_view_shows_24h_sparkline(self):
+        now = datetime.now(timezone.utc)
+        record_event_counts(self.project, self.issue, now, self.event.digest_order)
+        record_event_counts(
+            self.project, self.issue, datetime.now(timezone.utc) - timedelta(days=2), self.event.digest_order)
+
+        response = self.client.get(f"/issues/{self.project.id}/")
+
+        self.assertContains(response, "1 event in the past 24h")
 
     def test_issue_list_bulk_action_ignores_issues_from_other_projects(self):
         other_project = Project.objects.create(name="other")
@@ -434,12 +495,127 @@ class ViewTests(TransactionTestCase):
         other_issue.refresh_from_db()
         self.assertFalse(other_issue.is_resolved)
 
-    def test_issue_stacktrace(self):
+    def test_global_issue_list_only_shows_issues_from_projects_the_user_can_access(self):
+        self.issue.calculated_type = "AccessibleError"
+        self.issue.calculated_value = "visible"
+        self.issue.save(update_fields=["calculated_type", "calculated_value"])
+        other_project = Project.objects.create(name="other")
+        other_issue, _ = get_or_create_issue(other_project)
+        other_issue.calculated_type = "InaccessibleError"
+        other_issue.calculated_value = "hidden"
+        other_issue.save(update_fields=["calculated_type", "calculated_value"])
+
+        response = self.client.get("/issues/")
+
+        self.assertContains(response, "AccessibleError")
+        self.assertContains(response, self.issue.friendly_id())
+        self.assertNotContains(response, "InaccessibleError")
+
+    def test_global_issue_list_sorts_by_event_count_across_projects(self):
+        other_project = Project.objects.create(name="other")
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
+        other_issue, _ = get_or_create_issue(other_project)
+        self.issue.digested_event_count = 1
+        self.issue.save(update_fields=["digested_event_count"])
+        other_issue.digested_event_count = 10
+        other_issue.save(update_fields=["digested_event_count"])
+
+        response = self.client.get("/issues/", {"sort": "events"})
+
+        self.assertEqual([other_issue.id, self.issue.id], [issue.id for issue in response.context["page_obj"]])
+
+    def test_global_issue_list_ignores_pending_project_memberships(self):
+        pending_project = Project.objects.create(name="pending")
+        ProjectMembership.objects.create(project=pending_project, user=self.user, accepted=False)
+        pending_issue, _ = get_or_create_issue(pending_project)
+        pending_issue.calculated_type = "PendingError"
+        pending_issue.calculated_value = "hidden"
+        pending_issue.save(update_fields=["calculated_type", "calculated_value"])
+
+        response = self.client.get("/issues/")
+
+        self.assertNotContains(response, "PendingError")
+
+    def test_global_issue_list_bulk_action_ignores_issues_from_inaccessible_projects(self):
+        other_project = Project.objects.create(name="other")
+        other_issue, _ = get_or_create_issue(other_project)
+
+        response = self.client.post(
+            "/issues/",
+            {"issue_ids[]": [str(other_issue.id)], "action": "resolve"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        other_issue.refresh_from_db()
+        self.assertFalse(other_issue.is_resolved)
+
+    def test_global_issue_list_deletes_issues_from_multiple_projects(self):
+        self.project.issue_count = 1
+        self.project.stored_event_count = 1
+        self.project.save(update_fields=["issue_count", "stored_event_count"])
+        self.issue.stored_event_count = 1
+        self.issue.save(update_fields=["stored_event_count"])
+
+        other_project = Project.objects.create(name="other", issue_count=1)
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
+        other_issue, _ = get_or_create_issue(other_project)
+
+        response = self.client.post(
+            "/issues/",
+            {
+                "issue_ids[]": [str(self.issue.id), str(other_issue.id)],
+                "action": "delete",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Issue.objects.filter(id__in=[self.issue.id, other_issue.id]).exists())
+        self.project.refresh_from_db()
+        other_project.refresh_from_db()
+        self.assertEqual(0, self.project.issue_count)
+        self.assertEqual(0, other_project.issue_count)
+
+    def test_log_message_is_the_issue_page_heading(self):
+        self.issue.calculated_type = "Log Message"
+        self.issue.calculated_value = "Could not reach upstream"
+        self.issue.save(update_fields=["calculated_type", "calculated_value"])
+
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
-        self.assertContains(response, self.issue.title())
+
+        self.assertRegex(response.content.decode(), r"<h1[^>]*>Could not reach upstream</h1>")
+
+    def test_log_level_is_shown_below_the_log_message_heading(self):
+        self.issue.calculated_type = "Log Message"
+        self.issue.calculated_value = "Could not reach upstream"
+        self.issue.save(update_fields=["calculated_type", "calculated_value"])
+        self.event.level = "warning"
+        self.event.save(update_fields=["level"])
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
+
+        self.assertContains(response, '<span class="font-bold">WARNING</span>')
+
+    def test_exception_type_and_value_remain_in_the_issue_page_header(self):
+        self.issue.calculated_type = "ValueError"
+        self.issue.calculated_value = "invalid value"
+        self.issue.save(update_fields=["calculated_type", "calculated_value"])
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
+
+        html = response.content.decode()
+        self.assertRegex(html, r"<h1[^>]*>ValueError</h1>")
+        self.assertRegex(html, r'<div class="text-xl[^"]*">invalid value</div>')
 
     def test_issue_details(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/details/")
+        self.assertContains(response, self.issue.title())
+
+    def test_issue_details_by_digest_order_with_tag_search(self):
+        event = create_event(self.project, self.issue, project_digest_order=2)
+        store_tags(event, self.issue, {"foo": "bar"})
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.digest_order}/details/?q=foo:bar")
+
         self.assertContains(response, self.issue.title())
 
     def test_issue_event_views_do_not_show_events_from_other_projects(self):
@@ -468,6 +644,35 @@ class ViewTests(TransactionTestCase):
     def test_issue_tags(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/tags/")
         self.assertContains(response, self.issue.title())
+
+    def test_aggregated_tag_values_are_not_filter_links(self):
+        store_tags(self.event, self.issue, {"many-values": "value-0"})
+        for i in range(1, 26):
+            event = create_event(self.project, self.issue, project_digest_order=i + 1)
+            store_tags(event, self.issue, {"many-values": f"value-{i}"})
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
+        self.assertContains(response, 'title="Filter issues by this tag"', count=3)
+        self.assertNotContains(response, 'title="Filter issues by this tag">...</a>')
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/tags/")
+        self.assertContains(response, 'title="Filter issues by this tag"', count=24)
+        self.assertNotContains(response, 'title="Filter issues by this tag">Other...</a>')
+
+    def test_issue_sidebar_summarizes_long_release_lists(self):
+        self.issue.events_at = "\n".join(f"2026.1.{i}.0" for i in range(10)) + "\n"
+        self.issue.save()
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{self.event.id}/")
+
+        self.assertContains(response, "... «4 more» ...,")
+        self.assertContains(response, "2026.1.0.0")
+        self.assertContains(response, "2026.1.1.0")
+        self.assertContains(response, "2026.1.2.0")
+        self.assertContains(response, "2026.1.7.0")
+        self.assertContains(response, "2026.1.8.0")
+        self.assertContains(response, "2026.1.9.0")
+        self.assertNotContains(response, "2026.1.4.0")
 
     def test_issue_grouping(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/grouping/")
@@ -502,6 +707,60 @@ class ViewTests(TransactionTestCase):
     def test_issue_event_list(self):
         response = self.client.get(f"/issues/issue/{self.issue.id}/events/")
         self.assertContains(response, self.issue.title())
+
+    def test_use_index_sourcemap_in_stacktrace(self):
+        debug_id = uuid.uuid4()
+        sourcemap = json.dumps({
+            "version": 3,
+            "sections": [{
+                "offset": {"line": 4, "column": 3},
+                "map": {
+                    "version": 3,
+                    "sources": ["section-source.ts"],
+                    "sourcesContent": ["INDEX_MAP_CONTEXT_LINE\nfollowing line"],
+                    "names": ["mappedFunction"],
+                    "mappings": "AAAAA",
+                },
+            }],
+        }).encode("utf-8")
+        sourcemap_file = File.objects.create(
+            checksum=hashlib.sha1(sourcemap).hexdigest(),
+            filename="bundle.js.map",
+            size=len(sourcemap),
+            data=sourcemap,
+        )
+        FileMetadata.objects.create(
+            project=self.project,
+            file=sourcemap_file,
+            debug_id=debug_id,
+            file_type="source_map",
+            data="{}",
+        )
+        event_data = {
+            "event_id": uuid.uuid4().hex,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "platform": "javascript",
+            "exception": {
+                "values": [{
+                    "type": "Error",
+                    "value": "test",
+                    "stacktrace": {
+                        "frames": [{"filename": "bundle.js", "lineno": 5, "colno": 4, "in_app": True}],
+                    },
+                }],
+            },
+            "debug_meta": {
+                "images": [{"type": "sourcemap", "code_file": "bundle.js", "debug_id": str(debug_id)}],
+            },
+        }
+        event = create_event(self.project, self.issue, event_data=event_data, project_digest_order=2)
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
+
+        self.assertEqual(200, response.status_code)
+        self.assertContains(response, "section-source.ts")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">1:1</span>.")
+        self.assertContains(response, "INDEX_MAP_CONTEXT_LINE")
 
     @patch("events.utils.ecma426.loads")
     def test_use_sourcemap_in_stacktrace(self, mock_ecma426_loads):
@@ -549,8 +808,11 @@ class ViewTests(TransactionTestCase):
 
         class FakeMapping:
             source = "good-source.ts"
-            original_line = 10
             name = "mappedFunction"
+
+            def __init__(self, original_line, original_column):
+                self.original_line = original_line
+                self.original_column = original_column
 
         class BrokenSourceMap:
             def lookup_left(self, *_args, **_kwargs):
@@ -558,8 +820,12 @@ class ViewTests(TransactionTestCase):
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
-                    return FakeMapping()
+                if (line, column) == (5, 11):
+                    return FakeMapping(10, 0)
+                if (line, column) == (6, 0):
+                    return FakeMapping(9, 4)
+                if (line, column) == (7, 0):
+                    return FakeMapping(8, 2)
 
         def fake_loads(data):
             sm = json.loads(data)
@@ -571,6 +837,7 @@ class ViewTests(TransactionTestCase):
 
         mock_ecma426_loads.side_effect = fake_loads
 
+        # This four-case missing/zero × raw/mapped matrix is defensive; we haven't seen problems in the wild yet.
         event_data = {
             "event_id": uuid.uuid4().hex,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -584,6 +851,10 @@ class ViewTests(TransactionTestCase):
                             {"filename": "missing.js", "lineno": 3, "colno": 9, "in_app": True},
                             {"filename": "broken.js", "lineno": 11, "colno": 36758, "in_app": True},
                             {"filename": "good.js", "lineno": 6, "colno": 12, "in_app": True},
+                            {"filename": "good.js", "lineno": 7, "colno": 0, "in_app": True},
+                            {"filename": "good.js", "lineno": 8, "in_app": True},
+                            {"filename": "zero-column.js", "lineno": 5, "colno": 0, "in_app": True},
+                            {"filename": "no-column.js", "lineno": 4, "in_app": True},
                         ]
                     },
                 }]
@@ -601,10 +872,15 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, f"No sourcemaps found for Debug ID {missing_debug_id}")
-        self.assertContains(response, f"Error mapping (10, 36758) into sourcemap ({broken_debug_id})")
-        self.assertContains(response, "broken.js")
+        self.assertContains(response, f"Error mapping (10, 36757) into sourcemap ({broken_debug_id})")
+        self.assertContains(response, "missing.js</span> line <span class=\"font-bold\">3:9</span>.")
+        self.assertContains(response, "broken.js</span> line <span class=\"font-bold\">11:36758</span>.")
         self.assertContains(response, "good-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11:1</span>.")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">10:5</span>.")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">9:3</span>.")
+        self.assertContains(response, "zero-column.js</span> line <span class=\"font-bold\">5</span>.")
+        self.assertContains(response, "no-column.js</span> line <span class=\"font-bold\">4</span>.")
 
     @patch("events.utils.ecma426.loads")
     def test_use_sourcemap_in_stacktrace_with_null_sources_content(self, mock_ecma426_loads):
@@ -632,11 +908,12 @@ class ViewTests(TransactionTestCase):
         class FakeMapping:
             source = "good-source.ts"
             original_line = 10
+            original_column = 0
             name = "mappedFunction"
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
+                if (line, column) == (5, 11):
                     return FakeMapping()
 
         mock_ecma426_loads.return_value = GoodSourceMap()
@@ -667,14 +944,86 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, "good-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11:1</span>")
+
+    @patch("events.utils.ecma426.loads")
+    def test_use_sourcemap_in_stacktrace_matching_code_file_on_abs_path(self, mock_ecma426_loads):
+        # A debug image's code_file is the absolute path of the file, i.e. the frame's abs_path. Browser SDKs put the
+        # same URL in filename and abs_path, but @sentry/cloudflare (Workers) reports filename "index.js" for abs_path
+        # "/index.js", as do this test's frames.
+        debug_id = uuid.uuid4()
+        missing_debug_id = uuid.uuid4()
+
+        sourcemap = json.dumps({
+            "version": 3,
+            "sources": ["good-source.ts"],
+            "sourcesContent": [
+                "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10\nline 11\nline 12"
+            ],
+            "names": [],
+            "mappings": "",
+        }).encode("utf-8")
+
+        sourcemap_file = File.objects.create(
+            checksum=hashlib.sha1(sourcemap).hexdigest(),
+            filename="index.js.map",
+            size=len(sourcemap),
+            data=sourcemap,
+        )
+        FileMetadata.objects.create(file=sourcemap_file, debug_id=debug_id, file_type="source_map", data="{}")
+
+        class FakeMapping:
+            source = "good-source.ts"
+            original_line = 10
+            original_column = 0
+            name = "mappedFunction"
+
+        class GoodSourceMap:
+            def lookup_left(self, line, column):
+                if (line, column) == (5, 11):
+                    return FakeMapping()
+
+        mock_ecma426_loads.return_value = GoodSourceMap()
+
+        event_data = {
+            "event_id": uuid.uuid4().hex,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "platform": "javascript",
+            "exception": {
+                "values": [{
+                    "type": "Error",
+                    "value": "test",
+                    "stacktrace": {
+                        "frames": [
+                            {"filename": "missing.js", "abs_path": "/missing.js", "lineno": 3, "colno": 9,
+                             "in_app": True},
+                            {"filename": "index.js", "abs_path": "/index.js", "lineno": 6, "colno": 12,
+                             "in_app": True},
+                        ]
+                    },
+                }]
+            },
+            "debug_meta": {
+                "images": [
+                    {"type": "sourcemap", "code_file": "/missing.js", "debug_id": str(missing_debug_id)},
+                    {"type": "sourcemap", "code_file": "/index.js", "debug_id": str(debug_id)},
+                ]
+            },
+        }
+        event = create_event(self.project, self.issue, event_data=event_data, project_digest_order=2)
+
+        response = self.client.get(f"/issues/issue/{self.issue.id}/event/{event.id}/")
+        self.assertEqual(200, response.status_code)
+        self.assertContains(response, f"No sourcemaps found for Debug ID {missing_debug_id}")
+        self.assertContains(response, "good-source.ts")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">11:1</span>")
 
     @patch("events.utils.ecma426.loads")
     def test_sourcemap_uploads_are_project_scoped_when_rendering_events(self, mock_ecma426_loads):
         debug_id = uuid.uuid4()
-        auth_token = AuthToken.objects.create()
+        auth_token = AuthToken.objects.create(debug_files_upload=True)
         other_project = Project.objects.create(name="other")
-        ProjectMembership.objects.create(project=other_project, user=self.user)
+        ProjectMembership.objects.create(project=other_project, user=self.user, accepted=True)
         other_issue, _ = get_or_create_issue(other_project)
         sourcemap = json.dumps({
             "version": 3,
@@ -719,11 +1068,12 @@ class ViewTests(TransactionTestCase):
         class FakeMapping:
             source = "other-project-source.ts"
             original_line = 0
+            original_column = 0
             name = "mappedFunction"
 
         class GoodSourceMap:
             def lookup_left(self, line, column):
-                if (line, column) == (5, 12):
+                if (line, column) == (5, 11):
                     return FakeMapping()
 
         mock_ecma426_loads.return_value = GoodSourceMap()
@@ -749,7 +1099,7 @@ class ViewTests(TransactionTestCase):
         response = self.client.get(f"/issues/issue/{other_issue.id}/event/{other_event.id}/")
         self.assertEqual(200, response.status_code)
         self.assertContains(response, "other-project-source.ts")
-        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">1</span>")
+        self.assertContains(response, "mappedFunction</span> line <span class=\"font-bold\">1:1</span>")
 
         # Negative case: the same debug ID does not resolve across project boundaries.
         event = create_event(self.project, self.issue, event_data=event_data, project_digest_order=2)
@@ -780,7 +1130,7 @@ class IntegrationTest(TransactionTestCase):
     def test_many_issues_ingest_and_show(self):
         user = User.objects.create_user(username='test', password='test')
         project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=project, user=user)
+        ProjectMembership.objects.create(project=project, user=user, accepted=True)
         self.client.force_login(user)
 
         sentry_auth_header = get_header_value(f"http://{ project.sentry_key }@hostisignored/{ project.id }")
@@ -875,7 +1225,7 @@ class IntegrationTest(TransactionTestCase):
     def test_render_stacktrace_md(self):
         user = User.objects.create_user(username='test', password='test')
         project = Project.objects.create(name="test")
-        ProjectMembership.objects.create(project=project, user=user)
+        ProjectMembership.objects.create(project=project, user=user, accepted=True)
         self.client.force_login(user)
 
         sentry_auth_header = get_header_value(f"http://{ project.sentry_key }@hostisignored/{ project.id }")
@@ -956,127 +1306,6 @@ _no source context available_
 _no source context available_''', md)
 
 
-class GroupingUtilsTestCase(DjangoTestCase):
-
-    def test_empty_data(self):
-        self.assertEqual("Log Message: <no log message> ⋄ <no transaction>", get_issue_grouper_for_data({}))
-
-    def test_logentry_message_takes_precedence(self):
-        self.assertEqual("Log Message: msg: ? ⋄ <no transaction>", get_issue_grouper_for_data({"logentry": {
-            "message": "msg: ?",
-            "formatted": "msg: foobar",
-        }}))
-
-    def test_logentry_with_formatted_only(self):
-        self.assertEqual("Log Message: msg: foobar ⋄ <no transaction>", get_issue_grouper_for_data({"logentry": {
-            "formatted": "msg: foobar",
-        }}))
-
-    def test_logentry_with_transaction(self):
-        self.assertEqual("Log Message: msg ⋄ transaction", get_issue_grouper_for_data({
-            "logentry": {
-                "message": "msg",
-            },
-            "transaction": "transaction",
-        }))
-
-    def test_exception_empty_trace(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [],
-        }}))
-
-    def test_exception_trace_no_data(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{}],
-        }}))
-
-    def test_exception_value_only(self):
-        self.assertEqual("Error: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"value": "exception message"}],
-        }}))
-
-    def test_exception_type_only(self):
-        self.assertEqual("KeyError ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError"}],
-        }}))
-
-    def test_exception_type_value(self):
-        self.assertEqual("KeyError: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError", "value": "exception message"}],
-        }}))
-
-    def test_exception_multiple_frames(self):
-        self.assertEqual("KeyError: exception message ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{}, {}, {}, {"type": "KeyError", "value": "exception message"}],
-        }}))
-
-    def test_exception_transaction(self):
-        self.assertEqual("KeyError ⋄ transaction", get_issue_grouper_for_data({
-            "transaction": "transaction",
-            "exception": {
-                "values": [{"type": "KeyError"}],
-            }
-        }))
-
-    def test_exception_function_is_ignored_unless_specifically_synthetic(self):
-        # I make no value-judgement here on whether this is something we want to replicate in the future; as it stands
-        # this test just documents the somewhat surprising behavior that we inherited from GlitchTip/Sentry.
-        self.assertEqual("Error ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "stacktrace": {
-                        "frames": [{"function": "foo"}],
-                    },
-                }],
-            },
-        }))
-
-    def test_synthetic_exception_only(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                }],
-            },
-        }))
-
-    def test_synthetic_exception_ignores_value(self):
-        self.assertEqual("<unknown> ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                    "value": "the ignored value",
-                }],
-            },
-        }))
-
-    def test_exception_uses_function_when_top_level_exception_is_synthetic(self):
-        self.assertEqual("foo ⋄ <no transaction>", get_issue_grouper_for_data({
-            "exception": {
-                "values": [{
-                    "mechanism": {"synthetic": True},
-                    "stacktrace": {
-                        "frames": [{"function": "foo"}],
-                    },
-                }],
-            },
-        }))
-
-    def test_exception_with_non_string_value(self):
-        # In the GlitchTip code there is a mention of value sometimes containing a non-string value. Whether this
-        # happens in practice is unknown to me, but let's build something that can handle it.
-        self.assertEqual("KeyError: 123 ⋄ <no transaction>", get_issue_grouper_for_data({"exception": {
-            "values": [{"type": "KeyError", "value": 123}],
-        }}))
-
-    def test_simple_fingerprint(self):
-        self.assertEqual("fixed string", get_issue_grouper_for_data({"fingerprint": ["fixed string"]}))
-
-    def test_fingerprint_with_default(self):
-        self.assertEqual("Log Message: <no log message> ⋄ <no transaction> ⋄ fixed string",
-                         get_issue_grouper_for_data({"fingerprint": ["{{ default }}", "fixed string"]}))
-
-
 class IssueDeletionTestCase(TransactionTestCase):
 
     def setUp(self):
@@ -1095,7 +1324,7 @@ class IssueDeletionTestCase(TransactionTestCase):
         self.event.save()
 
         store_tags(self.event, self.issue, {"foo": "bar"})
-        record_event_counts(self.project, self.issue, self.event.digested_at)
+        record_event_counts(self.project, self.issue, self.event.digested_at, self.event.digest_order)
 
     def test_delete_issue(self):
         models = [apps.get_model(app_label=s.split('.')[0], model_name=s.split('.')[1].lower()) for s in [

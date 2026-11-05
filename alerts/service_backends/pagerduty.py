@@ -13,6 +13,8 @@ Setup:
     2. Navigate to: Integrations > Add Integration
     3. Select "Events API v2"
     4. Copy the 32-character Integration Key (Routing Key)
+
+Compatible with: Bugsink 2.1.x+
 """
 
 import json
@@ -26,6 +28,7 @@ from bugsink.app_settings import get_settings
 from bugsink.transaction import immediate_atomic
 
 from issues.models import Issue
+from .webhook_security import validate_webhook_url
 
 
 PAGERDUTY_EVENTS_URL = "https://events.pagerduty.com/v2/enqueue"
@@ -155,11 +158,13 @@ def pagerduty_send_test_message(routing_key, default_severity, service_name, inc
     }
 
     try:
+        validate_webhook_url(PAGERDUTY_EVENTS_URL)
         result = requests.post(
             PAGERDUTY_EVENTS_URL,
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
             timeout=5,
+            allow_redirects=False,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)
@@ -212,11 +217,13 @@ def pagerduty_send_alert(routing_key, default_severity, service_name, include_li
         payload["links"] = [{"href": issue_url, "text": "View in Bugsink"}]
 
     try:
+        validate_webhook_url(PAGERDUTY_EVENTS_URL)
         result = requests.post(
             PAGERDUTY_EVENTS_URL,
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
             timeout=5,
+            allow_redirects=False,
         )
         result.raise_for_status()
         _store_success_info(service_config_id)

@@ -1,9 +1,10 @@
 import json
 import uuid
+from collections import Counter
 from functools import partial
 
 from django.db import models, transaction
-from django.db.models import F, Q, Value
+from django.db.models import Case, F, Q, Value, When
 from django.db.models.functions import Concat
 from django.template.defaultfilters import date as default_date_filter
 from django.conf import settings
@@ -20,9 +21,10 @@ from alerts.tasks import send_unmute_alert
 from compat.timestamp import parse_timestamp, format_timestamp
 from tags.models import IssueTag, TagValue
 
+from .grouping_mechanisms import GROUPING_CHOICES
 from .utils import (
     parse_lines, serialize_lines, filter_qs_for_fixed_at, exclude_qs_for_fixed_at,
-    get_title_for_exception_type_and_value)
+    get_title_for_exception_type_and_value, LOG_MESSAGE_TYPE)
 
 from .tasks import delete_issue_deps
 
@@ -63,6 +65,7 @@ class Issue(models.Model):
     # what does this mean for the release-based use cases? it means what you filter on.
     # it also simply means: it was "marked as resolved" after the last regression (if any)
     is_resolved = models.BooleanField(default=False)
+    is_resolved_unconditionally = models.BooleanField(default=False)
     is_resolved_by_next_release = models.BooleanField(default=False)
 
     fixed_at = models.TextField(blank=True, null=False, default='')  # line-separated list
@@ -88,18 +91,7 @@ class Issue(models.Model):
             return  # quick check for performance; also: idempotency w.r.t. updates to counts.
 
         self.is_deleted = True
-        self.save(update_fields=["is_deleted"])
-        from projects.models import Project
-        Project.objects.filter(id=self.project_id).update(issue_count=F("issue_count") - 1)
-
-        # we set grouping_key_hash to None to ensure that event digests that happen simultaneously with the delayed
-        # cleanup will get their own fresh Grouping and hence Issue. This matches with the behavior that would happen
-        # if Issue deletion would have been instantaneous (i.e. it's the least surprising behavior).
-        #
-        # `issue=None` is explicitly _not_ part of this update, such that the actual deletion of the Groupings will be
-        # picked up as part of the delete_issue_deps task.
-        self.grouping_set.all().update(grouping_key_hash=None)
-
+        mark_issues_for_deletion([(self.id, self.project_id)])
         delay_on_commit(delete_issue_deps, str(self.project_id), str(self.id))
 
     def friendly_id(self):
@@ -110,6 +102,10 @@ class Issue(models.Model):
 
     def title(self):
         return get_title_for_exception_type_and_value(self.calculated_type, self.calculated_value)
+
+    def is_log_message(self):
+        # Ingest keeps calculated_type in sync with the issue's latest event.
+        return self.calculated_type == LOG_MESSAGE_TYPE
 
     def get_fixed_at(self):
         return parse_lines(self.fixed_at)
@@ -195,6 +191,7 @@ class Issue(models.Model):
                     "value": TagValue(value=other_label),
                     "count": total_seen - seen_till_now,
                     "pct": int((total_seen - seen_till_now) / total_seen * 100),
+                    "is_other": True,
                 })
 
             result.append(issue_tags)
@@ -206,13 +203,46 @@ class Issue(models.Model):
             ("project", "digest_order"),
         ]
         indexes = [
-            # 4 indexes for the list view (state_filter). Note: no is_deleted here; basic assumption is: is_deleted=True
-            # are such a minority that a post-index filter is more efficient than having more indexes. see 7b340fd8ff1d
+            # Resolved and muted cannot overlap. The list queries include the implied condition: resolved also filters
+            # on is_muted=False, muted also filters on is_resolved=False, and open already filters on both fields. This
+            # lets open, muted, and resolved share the (is_resolved, is_muted, ordering) index.
+            #
+            # Unresolved only fixes is_resolved. Because is_muted comes before the ordering field, that index cannot
+            # return open and muted issues together in the requested order. Unresolved therefore scans the broad
+            # ordering index and skips resolved issues. A sparse or empty unresolved list can scan most or all of the
+            # relevant range. This is accepted because unresolved is the least interesting tab and should work well
+            # enough in practice.
+            # Note: no is_deleted here; basic assumption is:
+            # is_deleted=True are such a minority that a post-index filter is more efficient than having more indexes.
+            # See 7b340fd8ff1d.
             # `issue_list_open` is also used for project-level open-issue counting (same where-clause prefix).
             models.Index(fields=["project", "is_resolved", "is_muted", "last_seen"], name="issue_list_open"),
-            models.Index(fields=["project", "is_muted", "last_seen"], name="issue_list_muted"),
-            models.Index(fields=["project", "is_resolved", "last_seen"], name="issue_list_resolved"),  # and unresolved
-            models.Index(fields=["project", "last_seen"], name="issue_list_all"),  # all
+            models.Index(fields=["project", "last_seen"], name="issue_list_all"),
+
+            # Equivalent indexes for event-count sorting; last_seen breaks count ties.
+            models.Index(
+                fields=["project", "is_resolved", "is_muted", "digested_event_count", "last_seen"],
+                name="issue_count_open",
+            ),
+            models.Index(
+                fields=["project", "digested_event_count", "last_seen"],
+                name="issue_count_all",
+            ),
+
+            # Same filters/orderings for the global issue list, where the page is intentionally not anchored on one
+            # project. As above, no is_deleted: deleted issues should be a small minority.
+            models.Index(fields=["is_resolved", "is_muted", "last_seen"], name="issue_global_open"),
+            models.Index(fields=["last_seen"], name="issue_global_all"),
+
+            # Equivalent indexes for event-count sorting across projects.
+            models.Index(
+                fields=["is_resolved", "is_muted", "digested_event_count", "last_seen"],
+                name="issue_global_count_open",
+            ),
+            models.Index(
+                fields=["digested_event_count", "last_seen"],
+                name="issue_global_count_all",
+            ),
         ]
 
 
@@ -248,6 +278,8 @@ class Grouping(models.Model):
     # we hash the key to make it indexable on MySQL, see https://code.djangoproject.com/ticket/2495
     grouping_key_hash = models.CharField(max_length=64, blank=False, null=True)
 
+    grouping_mechanism = models.CharField(max_length=64, choices=GROUPING_CHOICES)
+
     issue = models.ForeignKey("Issue", blank=False, null=False, on_delete=models.DO_NOTHING)
 
     def __str__(self):
@@ -257,8 +289,34 @@ class Grouping(models.Model):
         unique_together = [
             # principled: grouping _key_ is a _key_ for a reason (within a project). This also implies the main way of
             # looking up groupings has an appropriate index.
-            ("project", "grouping_key_hash"),
+            ("project", "grouping_key_hash", "grouping_mechanism"),
         ]
+
+
+def mark_issues_for_deletion(issue_project_pairs):
+    from projects.models import Project
+
+    # The caller first reads issue and project IDs into a list. Reusing the list means all three bulk updates affect the
+    # same issues and lets us count deletions per project without another query. This costs three writes for the whole
+    # list, rather than three writes per issue.
+    issue_ids = [issue_id for issue_id, _project_id in issue_project_pairs]
+    deletions_per_project = Counter(project_id for _issue_id, project_id in issue_project_pairs)
+
+    Issue.objects.filter(id__in=issue_ids).update(is_deleted=True)
+    Project.objects.filter(id__in=deletions_per_project).update(
+        issue_count=Case(*[
+            When(id=project_id, then=F("issue_count") - count)
+            for project_id, count in deletions_per_project.items()
+        ])
+    )
+
+    # We set grouping_key_hash to None to ensure that event digests that happen simultaneously with the delayed cleanup
+    # will get their own fresh Grouping and hence Issue. This matches the behavior that would happen if Issue deletion
+    # were instantaneous (i.e. it's the least surprising behavior).
+    #
+    # `issue=None` is explicitly _not_ part of this update, such that the actual deletion of the Groupings will be
+    # picked up as part of dependency cleanup.
+    Grouping.objects.filter(issue_id__in=issue_ids).update(grouping_key_hash=None)
 
 
 def format_unmute_reason(unmute_metadata):
@@ -283,7 +341,8 @@ class IssueStateManager(object):
     @staticmethod
     def resolve(issue):
         issue.is_resolved = True
-        issue.add_fixed_at("")  # i.e. fixed in the no-release-info-available release
+        issue.is_resolved_unconditionally = True
+        issue.is_resolved_by_next_release = False
 
         # an issue cannot be both resolved and muted; muted means "the problem persists but don't tell me about it
         # (or maybe unless some specific condition happens)" and resolved means "the problem is gone". Hence, resolving
@@ -296,6 +355,8 @@ class IssueStateManager(object):
     def resolve_by_latest(issue):
         # NOTE: currently unused; we may soon reintroduce it though so I left it in.
         issue.is_resolved = True
+        issue.is_resolved_unconditionally = False
+        issue.is_resolved_by_next_release = False
         issue.add_fixed_at(issue.project.get_latest_release().version)
         IssueStateManager.unmute(issue)  # as in IssueStateManager.resolve()
 
@@ -303,29 +364,31 @@ class IssueStateManager(object):
     def resolve_by_release(issue, release_version):
         # release_version: str
         issue.is_resolved = True
+        issue.is_resolved_unconditionally = False
+        issue.is_resolved_by_next_release = False
         issue.add_fixed_at(release_version)
         IssueStateManager.unmute(issue)  # as in IssueStateManager.resolve()
 
     @staticmethod
     def resolve_by_next(issue):
         issue.is_resolved = True
+        issue.is_resolved_unconditionally = False
         issue.is_resolved_by_next_release = True
         IssueStateManager.unmute(issue)  # as in IssueStateManager.resolve()
 
     @staticmethod
     def reopen(issue):
-        # this is called "reopen", but since there's no UI for it, it's more like "deal with a regression" (i.e. that's
-        # the only way this gets called).
         issue.is_resolved = False
+        issue.is_resolved_unconditionally = False
+        issue.is_resolved_by_next_release = False  # clear related is_resolved_xxx state too
 
-        # we don't touch is_resolved_by_next_release (i.e. set to False) here. Why? The simple/principled answer is that
-        # observations that Bugsink can make can by definition not be about the future. If the user tells us "this
-        # is fixed in some not-yet-released version" there's just no information ever in Bugsink to refute that".
-        # (BTW this point in the code cannot be reached when issue.is_resolved_by_next_release is True anyway)
+        # we don't touch `fixed_at`. The meaning of that field is "reports came in about fixes at these points in time",
+        # not "it actually _was_ fixed at all of those points" and the finer differences between those 2 statements is
+        # precisely what we have quite some "is_regression" logic for.
 
-        # we also don't touch `fixed_at`. The meaning of that field is "reports came in about fixes at these points in
-        # time", not "it actually _was_ fixed at all of those points" and the finer differences between those 2
-        # statements is precisely what we have quite some "is_regression" logic for.
+        # This also means that if you clicked resolve by mistake and immediately reopen, the stale fixed_at marker
+        # remains. Full undo would be more principled but also more complex (implementation requires historic
+        # information)
 
         # as in IssueStateManager.resolve(), but not because a reopened issue cannot be muted in principle (i.e. we
         # could mute it soon after reopening) but because when reopening an issue you're doing this from a resolved
@@ -416,20 +479,23 @@ class IssueQuerysetStateManager(object):
     def _resolve_at(issue_qs, release_version):
         filter_qs_for_fixed_at(issue_qs, release_version).update(
             is_resolved=True,
+            is_resolved_unconditionally=False,
+            is_resolved_by_next_release=False,
         )
-        exclude_qs_for_fixed_at(issue_qs, "").update(
+        exclude_qs_for_fixed_at(issue_qs, release_version).update(
             is_resolved=True,
-            fixed_at=Concat(F("fixed_at"), Value(release_version + "\n")),
-        )
-
-        # release_version: str
-        issue_qs.update(
+            is_resolved_unconditionally=False,
+            is_resolved_by_next_release=False,
             fixed_at=Concat(F("fixed_at"), Value(release_version + "\n")),
         )
 
     @staticmethod
     def resolve(issue_qs):
-        IssueQuerysetStateManager._resolve_at(issue_qs, "")  # i.e. fixed in the no-release-info-available release
+        issue_qs.update(
+            is_resolved=True,
+            is_resolved_unconditionally=True,
+            is_resolved_by_next_release=False,
+        )
 
         # an issue cannot be both resolved and muted; muted means "the problem persists but don't tell me about it
         # (or maybe unless some specific condition happens)" and resolved means "the problem is gone". Hence, resolving
@@ -460,6 +526,7 @@ class IssueQuerysetStateManager(object):
     def resolve_by_next(issue_qs):
         issue_qs.update(
             is_resolved=True,
+            is_resolved_unconditionally=False,
             is_resolved_by_next_release=True,
         )
 
@@ -467,9 +534,13 @@ class IssueQuerysetStateManager(object):
 
     @staticmethod
     def reopen(issue_qs):
-        # we don't need reopen() over a queryset (yet); reason being that we don't allow reopening of issues from the UI
-        # and hence not in bulk.
-        raise NotImplementedError("reopen is not implemented - see comments above")
+        # Currently unused by the UI; implemented for completeness because generic issue-action plumbing supports it.
+        issue_qs.update(
+            is_resolved=False,
+            is_resolved_unconditionally=False,
+            is_resolved_by_next_release=False,
+        )
+        IssueQuerysetStateManager.unmute(issue_qs)
 
     @staticmethod
     def mute(issue_qs, unmute_on_volume_based_conditions="[]", unmute_after=None):
@@ -505,8 +576,13 @@ class IssueQuerysetStateManager(object):
 
     @staticmethod
     def delete(issue_qs):
-        for issue in issue_qs:
-            issue.delete_deferred()
+        issue_project_pairs = list(issue_qs.values_list("id", "project_id"))
+        if not issue_project_pairs:
+            return
+
+        mark_issues_for_deletion(issue_project_pairs)
+        for issue_id, project_id in issue_project_pairs:
+            delay_on_commit(delete_issue_deps, str(project_id), str(issue_id))
 
 
 def is_valid_issue_action(action, issue):
@@ -517,16 +593,15 @@ def is_valid_issue_action(action, issue):
         # any type of issue can be deleted
         return True
 
+    if action == "reopen":
+        # reopen is the only one that requires the issue to currently be resolved
+        return issue.is_resolved
+
     if issue.is_resolved:
-        # any action is illegal on resolved issues (as per our current UI)
+        # any other action is illegal on resolved issues
         return False
 
-    if action.startswith("resolved_release:"):
-        release_version = action.split(":", 1)[1]
-        if release_version + "\n" in issue.events_at:
-            return False
-
-    elif action.startswith("mute"):
+    if action.startswith("mute"):
         if issue.is_muted:
             return False
 
@@ -546,13 +621,13 @@ def q_for_invalid_issue_action(action):
         # delete is always valid, so we don't want any issues to be returned, https://stackoverflow.com/a/39001190
         return Q(pk__in=[])
 
-    illegal_conditions = Q(is_resolved=True)  # any action is illegal on resolved issues (as per our current UI)
+    if action == "reopen":
+        # reopen is the only one that requires the issue to currently be resolved
+        return Q(is_resolved=False)
 
-    if action.startswith("resolved_release:"):
-        release_version = action.split(":", 1)[1]
-        illegal_conditions = illegal_conditions | Q(events_at__contains=release_version + "\n")
+    illegal_conditions = Q(is_resolved=True)  # any other action is illegal on resolved issues
 
-    elif action.startswith("mute"):
+    if action.startswith("mute"):
         illegal_conditions = illegal_conditions | Q(is_muted=True)
 
     elif action == "unmute":
@@ -573,6 +648,8 @@ def make_issue_history(issue_or_qs, action, user):
         kind = TurningPointKind.MUTED
     elif action == "unmute":
         kind = TurningPointKind.UNMUTED
+    elif action == "reopen":
+        kind = TurningPointKind.REOPENED
     else:
         raise ValueError(f"unknown action: {action}")
 
@@ -627,8 +704,8 @@ def apply_issue_action(manager, issue_or_qs, action, user):
         manager.resolve_by_release(issue_or_qs, release_version)
     elif action == "resolved_next":
         manager.resolve_by_next(issue_or_qs)
-    # elif action == "reopen":  # not allowed from the UI
-    #     manager.reopen(issue_or_qs)
+    elif action == "reopen":
+        manager.reopen(issue_or_qs)
     elif action == "mute":
         manager.mute(issue_or_qs)
     elif action.startswith("mute_for:"):
@@ -660,6 +737,7 @@ class TurningPointKind(models.IntegerChoices):
     MUTED = 3, _("Muted")
     REGRESSED = 4, _("Marked as regressed")
     UNMUTED = 5, _("Unmuted")
+    REOPENED = 6, _("Reopened")
 
     NEXT_MATERIALIZED = 10, _("Release info added")
 

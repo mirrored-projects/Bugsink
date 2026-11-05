@@ -12,7 +12,7 @@
 
 import logging
 from django.conf import settings
-from events.utils import apply_sourcemaps
+from events.utils import apply_sourcemaps, get_stacktrace_entries, get_thread_stacktrace_entries
 
 from sentry_sdk_extensions import capture_or_log_exception
 
@@ -42,25 +42,18 @@ def _code_lines(frame):
     return lines
 
 
-def _iter_exceptions(parsed):
-    exc = parsed.get("exception")
-    if not exc:
-        return []
-    if isinstance(exc, dict):
-        return list(exc.get("values") or [])
-    if isinstance(exc, (list, tuple)):
-        return list(exc)
-    return []
-
-
 def _frames_for_exception(exc):
     st = exc.get("stacktrace") or {}
     return list(st.get("frames") or [])
 
 
 def _header_lines(event, exc):
+    if not exc["is_exception_stacktrace"]:
+        return [f"# {event.title()}"]
+
     etype = exc.get("type") or "Exception"
     val = exc.get("value") or ""
+
     # Two-line title; no platform/event_id/timestamp clutter.
     return [f"# {etype}", val]
 
@@ -133,6 +126,47 @@ def _select_frames(frames, in_app_only):
     return filtered if filtered else frames
 
 
+def _frame_lines(exc, stack_of_plates, in_app_only, include_locals):
+    frames = _frames_for_exception(exc)
+    if stack_of_plates and frames:
+        frames = list(reversed(frames))
+
+    lines = []
+    for frame in _select_frames(frames, in_app_only):
+        lines.append("")
+        lines += _format_frame_header(frame)
+
+        code_listing = _format_code_gutter(frame)
+        if code_listing:
+            lines += code_listing
+        else:
+            lines.append("_no source context available_")
+
+        if include_locals:
+            loc_lines = _format_locals(frame)
+            if loc_lines:
+                lines += loc_lines
+
+    return lines
+
+
+def _thread_lines(threads, stack_of_plates, in_app_only, include_locals):
+    lines = []
+    for thread in threads:
+        if len(threads) > 1:
+            lines += ["", f"## {thread['thread_title']}"]
+            if thread["thread_description"]:
+                lines.append(f"_{thread['thread_description']}_")
+
+        if not _frames_for_exception(thread):
+            lines += ["", "_No stacktrace found._"]
+            continue
+
+        lines += _frame_lines(thread, stack_of_plates, in_app_only, include_locals)
+
+    return lines
+
+
 def render_stacktrace_md(event, in_app_only=False, include_locals=True):
     parsed = event.get_parsed_data()
     try:
@@ -145,41 +179,30 @@ def render_stacktrace_md(event, in_app_only=False, include_locals=True):
         # sourcemaps are still experimental; we don't want to fail on them, so we just log the error and move on.
         capture_or_log_exception(e, logger)
 
-    excs = _iter_exceptions(parsed)
+    excs = get_stacktrace_entries(parsed)
     if not excs:
         return "_No stacktrace available._"
 
     stack_of_plates = getattr(event, "platform", None) != "python"
-    if stack_of_plates:
+    is_exception_stacktrace = excs[0]["is_exception_stacktrace"]
+    if stack_of_plates and is_exception_stacktrace:
         excs = list(reversed(excs))
 
     lines = []
+    if not is_exception_stacktrace:
+        lines += _header_lines(event, excs[0])
+        lines += _thread_lines(excs, stack_of_plates, in_app_only, include_locals)
+        return "\n".join([s.rstrip() for s in lines]).strip()
+
     for i, exc in enumerate(excs):
         if i > 0:
             lines += ["", "**During handling of the above exception, another exception occurred:**", ""]
         lines += _header_lines(event, exc)
+        lines += _frame_lines(exc, stack_of_plates, in_app_only, include_locals)
 
-        frames_list = _frames_for_exception(exc) or []
-        if stack_of_plates and frames_list:
-            frames_list = list(reversed(frames_list))
-
-        frames_list = _select_frames(frames_list, in_app_only)
-
-        for frame in frames_list:
-            # spacer above every frame header
-            lines.append("")
-            lines += _format_frame_header(frame)
-
-            code_listing = _format_code_gutter(frame)
-            if code_listing:
-                lines += code_listing
-            else:
-                # brief mention when no source context is available
-                lines.append("_no source context available_")
-
-            if include_locals:
-                loc_lines = _format_locals(frame)
-                if loc_lines:
-                    lines += loc_lines
+    threads = get_thread_stacktrace_entries(parsed)
+    if len(threads) > 1:
+        lines += ["", "# Threads"]
+        lines += _thread_lines(threads, stack_of_plates, in_app_only, include_locals)
 
     return "\n".join([s.rstrip() for s in lines]).strip()

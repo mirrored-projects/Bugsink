@@ -3,7 +3,7 @@ import datetime
 import io
 
 from django.core.management import call_command
-from django.test import TestCase as DjangoTestCase
+from django.test import TestCase as DjangoTestCase, override_settings
 from unittest import TestCase as RegularTestCase
 from unittest.mock import patch
 from django.contrib.auth import get_user_model
@@ -20,11 +20,78 @@ from .models import InstallationEventCountsPerHour, IssueEventCountsPerHour, Pro
 from .factories import create_event
 from .retention import (
     eviction_target, should_evict, evict_for_max_events, get_epoch_bounds_with_irrelevance, filter_for_work)
+from .sparklines import (
+    get_issue_event_sparkline, get_issue_list_event_sparklines, get_sparkline_range, get_y_labels)
 from .usage import EVENT_COUNTS_PER_HOUR_MAX_AGE, hour_bucket, record_event_counts
-from .utils import annotate_with_meta, annotate_var_with_meta
+from .utils import annotate_with_meta, annotate_var_with_meta, get_stacktrace_entries, get_sources_content
 from tags.models import EventTag, store_tags
+from tags.search import search_events
 
 User = get_user_model()
+
+
+class StacktraceEntriesTestCase(RegularTestCase):
+    def test_thread_stacktrace_entry_contains_thread_fields(self):
+        stacktrace = {"frames": [{"filename": "worker.py"}]}
+
+        entries = get_stacktrace_entries({
+            "threads": {"values": [{
+                "id": 7,
+                "name": "worker",
+                "crashed": False,
+                "state": "waiting",
+                "stacktrace": stacktrace,
+            }]},
+        })
+
+        self.assertEqual([{
+            "stacktrace": stacktrace,
+            "is_exception_stacktrace": False,
+            "thread_title": "Thread #7: worker",
+            "thread_description": "errored: no, state: Waiting",
+        }], entries)
+
+    def test_top_level_stacktrace_is_used_as_last_fallback(self):
+        stacktrace = {"frames": [{"filename": "scheduler.php", "lineno": 176}]}
+
+        entries = get_stacktrace_entries({
+            "logentry": {"formatted": "Scheduler task failed"},
+            "stacktrace": stacktrace,
+        })
+
+        self.assertEqual([{
+            "stacktrace": stacktrace,
+            "is_exception_stacktrace": False,
+        }], entries)
+
+    def test_thread_stacktrace_takes_precedence_over_top_level_stacktrace(self):
+        thread_stacktrace = {"frames": [{"filename": "thread.php"}]}
+
+        entries = get_stacktrace_entries({
+            "logentry": {"formatted": "Scheduler task failed"},
+            "threads": {"values": [{"stacktrace": thread_stacktrace}]},
+            "stacktrace": {"frames": [{"filename": "deprecated.php"}]},
+        })
+
+        self.assertEqual(thread_stacktrace, entries[0]["stacktrace"])
+
+
+class SourcesContentTestCase(RegularTestCase):
+    def test_regular_map(self):
+        self.assertEqual({"a.ts": ["a1", "a2"]}, get_sources_content({
+            "sources": ["a.ts", "b.ts"],
+            "sourcesContent": ["a1\na2", None],
+        }))
+
+    def test_index_map(self):
+        self.assertEqual({"a.ts": ["a1"], "b.ts": ["b1"]}, get_sources_content({
+            "sources": [],
+            "sections": [
+                {"offset": {"line": 0, "column": 0}, "map": {"sources": ["a.ts"], "sourcesContent": ["a1"]}},
+                {"offset": {"line": 5, "column": 0}, "map": {"sources": ["b.ts"], "sourcesContent": ["b1"]}},
+                {"offset": {"line": 9, "column": 0}, "map": {"sources": ["a.ts"], "sourcesContent": [None]}},
+            ],
+        }))
 
 
 class ViewTests(TransactionTestCase):
@@ -34,7 +101,7 @@ class ViewTests(TransactionTestCase):
         super().setUp()
         self.user = User.objects.create_user(username='test', password='test')
         self.project = Project.objects.create()
-        ProjectMembership.objects.create(project=self.project, user=self.user)
+        ProjectMembership.objects.create(project=self.project, user=self.user, accepted=True)
         self.issue, _ = get_or_create_issue(project=self.project)
         self.event = create_event(self.project, self.issue)
         self.client.force_login(self.user)
@@ -51,17 +118,12 @@ class ViewTests(TransactionTestCase):
         self.assertEqual(response['Content-Type'], 'application/json')
         self.assertTrue("platform" in response.json())
 
-    def test_event_plaintext(self):
-        response = self.client.get(f"/events/event/{self.event.pk}/plain/")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response['Content-Type'], 'text/plain')
-
     def test_event_views_forbid_events_from_other_projects(self):
         other_project = Project.objects.create(name="other")
         other_issue, _ = get_or_create_issue(project=other_project)
         other_event = create_event(other_project, other_issue)
 
-        for suffix in ["download/", "raw/", "plain/", "md/"]:
+        for suffix in ["download/", "raw/", "md/"]:
             with self.subTest(suffix=suffix):
                 response = self.client.get(f"/events/event/{other_event.pk}/{suffix}")
                 self.assertEqual(response.status_code, 403)
@@ -101,9 +163,9 @@ class EventUsageTestCase(DjangoTestCase):
         first_hour = datetime.datetime(2026, 6, 14, 12, 34, tzinfo=datetime.timezone.utc)
         next_hour = datetime.datetime(2026, 6, 14, 13, 1, tzinfo=datetime.timezone.utc)
 
-        record_event_counts(project, issue, first_hour)
-        record_event_counts(project, issue, first_hour)
-        record_event_counts(project, issue, next_hour)
+        record_event_counts(project, issue, first_hour, 1)
+        record_event_counts(project, issue, first_hour, 2)
+        record_event_counts(project, issue, next_hour, 3)
 
         self.assertEqual(2, InstallationEventCountsPerHour.objects.get(bucket=hour_bucket(first_hour)).count)
         self.assertEqual(1, InstallationEventCountsPerHour.objects.get(bucket=hour_bucket(next_hour)).count)
@@ -111,7 +173,9 @@ class EventUsageTestCase(DjangoTestCase):
             2,
             ProjectEventCountsPerHour.objects.get(project=project, bucket=hour_bucket(first_hour)).count,
         )
-        self.assertEqual(2, IssueEventCountsPerHour.objects.get(issue=issue, bucket=hour_bucket(first_hour)).count)
+        issue_bucket = IssueEventCountsPerHour.objects.get(issue=issue, bucket=hour_bucket(first_hour))
+        self.assertEqual(2, issue_bucket.count)
+        self.assertEqual(2, issue_bucket.digest_order)
 
     def test_record_event_counts_cleans_up_old_buckets(self):
         project = Project.objects.create(name="usage cleanup")
@@ -129,7 +193,7 @@ class EventUsageTestCase(DjangoTestCase):
         IssueEventCountsPerHour.objects.create(project=other_project, issue=other_issue, bucket=old_bucket, count=1)
         IssueEventCountsPerHour.objects.create(project=project, issue=issue, bucket=recent_bucket, count=1)
 
-        record_event_counts(project, issue, new_hour)
+        record_event_counts(project, issue, new_hour, 1)
 
         self.assertFalse(InstallationEventCountsPerHour.objects.filter(bucket=old_bucket).exists())
         self.assertFalse(ProjectEventCountsPerHour.objects.filter(bucket=old_bucket).exists())
@@ -137,6 +201,295 @@ class EventUsageTestCase(DjangoTestCase):
         self.assertTrue(InstallationEventCountsPerHour.objects.filter(bucket=recent_bucket).exists())
         self.assertTrue(ProjectEventCountsPerHour.objects.filter(bucket=recent_bucket).exists())
         self.assertTrue(IssueEventCountsPerHour.objects.filter(bucket=recent_bucket).exists())
+
+
+class EventSparklineTestCase(DjangoTestCase):
+    def test_y_labels_respect_max_labels(self):
+        cases_by_max_labels = [
+            # max_labels 0, 1 are somewhat nonsensical anyway (you'd label top & bottom at the least in practice)
+            (0, [
+                (   0, []),
+                ( 1.2, []),
+            ]),
+            (1, [
+                (   0, [   1]),
+                (   1, [   1]),
+                (1410, [1410]),
+            ]),
+
+            # max_labels=2
+            (2, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   2, [   2,    0]),
+                (  10, [  10,    0]),
+                (  11, [  12,    0]),
+                (  80, [  80,    0]),
+                (  81, [ 100,    0]),
+                (  90, [ 100,    0]),
+                (  91, [ 100,    0]),
+                ( 100, [ 100,    0]),
+                ( 101, [ 120,    0]),
+                (1000, [1000,    0]),
+                (1001, [1200,    0]),
+            ]),
+
+            # max_labels=3
+            (3, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   2, [   2,    1,    0]),
+                (   3, [   4,    2,    0]),
+                (   8, [   8,    4,    0]),
+                (   9, [  10,    5,    0]),
+                (  10, [  10,    5,    0]),
+                (  11, [  12,    6,    0]),
+                (  18, [  20,   10,    0]),
+                (  21, [  24,   12,    0]),
+                (  24, [  24,   12,    0]),
+                (  25, [  25,    0]),
+                (  50, [  50,   25,    0]),
+                (  75, [  80,   40,    0]),
+                (  80, [  80,   40,    0]),
+                (  81, [ 100,   50,    0]),
+                ( 100, [ 100,   50,    0]),
+                ( 101, [ 120,   60,    0]),
+                ( 800, [ 800,  400,    0]),
+                ( 801, [1000,  500,    0]),
+                (1000, [1000,  500,    0]),
+                (1001, [1200,  600,    0]),
+            ]),
+
+            # max_labels=4
+            (4, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   2, [   2,    1,    0]),
+                (   3, [   3,    2,    1,    0]),
+                (   4, [   4,    2,    0]),
+                (   8, [   9,    6,    3,    0]),
+                (  10, [  10,    5,    0]),
+                (  11, [  12,    8,    4,    0]),
+                (  25, [  30,   20,   10,    0]),
+                (  38, [  40,   20,    0]),
+                (  50, [  60,   40,   20,    0]),
+                (  80, [  90,   60,   30,    0]),
+                (  81, [  90,   60,   30,    0]),
+                (  91, [ 100,   50,    0]),
+                ( 100, [ 100,   50,    0]),
+                ( 101, [ 120,   80,   40,    0]),
+            ]),
+
+            # max_labels=5
+            (5, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   4, [   4,    3,    2,    1,    0]),
+                (   5, [   6,    4,    2,    0]),
+                (   8, [   8,    6,    4,    2,    0]),
+                (   9, [   9,    6,    3,    0]),
+                (  10, [  12,    9,    6,    3,    0]),
+                (  11, [  12,    9,    6,    3,    0]),
+                (  25, [  30,   20,   10,    0]),
+                (  38, [  40,   30,   20,   10,    0]),
+                (  48, [  48,   36,   24,   12,    0]),
+                (  50, [  50,   25,    0]),
+                (  80, [  80,   60,   40,   20,    0]),
+                (  81, [ 100,   75,   50,   25,    0]),
+                ( 100, [ 100,   75,   50,   25,    0]),
+            ]),
+
+            # max_labels=10
+            (10, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   8, [   8,    7,    6,    5,    4,    3,    2,    1,    0]),
+                (   9, [   9,    8,    7,    6,    5,    4,    3,    2,    1,    0]),
+                (  10, [  10,    8,    6,    4,    2,    0]),
+                (  11, [  12,   10,    8,    6,    4,    2,    0]),
+                (  80, [  80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  81, [  90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  82, [  90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  90, [  90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  91, [ 100,   80,   60,   40,   20,    0]),
+                ( 100, [ 100,   80,   60,   40,   20,    0]),
+                ( 101, [ 120,  100,   80,   60,   40,   20,    0]),
+                ( 800, [ 800,  700,  600,  500,  400,  300,  200,  100,    0]),
+                ( 900, [ 900,  800,  700,  600,  500,  400,  300,  200,  100,    0]),
+                ( 901, [1000,  800,  600,  400,  200,    0]),
+                (1000, [1000,  800,  600,  400,  200,    0]),
+                (1001, [1200, 1000,  800,  600,  400,  200,    0])
+            ]),
+
+            # max_labels=11
+            (11, [
+                (   0, [   1,    0]),
+                (   1, [   1,    0]),
+                (   5, [   5,    4,    3,    2,    1,    0]),
+                (   8, [   8,    7,    6,    5,    4,    3,    2,    1,    0]),
+                (   9, [   9,    8,    7,    6,    5,    4,    3,    2,    1,    0]),
+                (  10, [  10,    9,    8,    7,    6,    5,    4,    3,    2,    1,    0]),
+                (  11, [  12,   10,    8,    6,    4,    2,    0]),
+                (  48, [  50,   45,   40,   35,   30,   25,   20,   15,   10,    5,    0]),
+                (  50, [  50,   45,   40,   35,   30,   25,   20,   15,   10,    5,    0]),
+                (  75, [  80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  80, [  80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  81, [ 100,   90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                (  91, [ 100,   90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                ( 100, [ 100,   90,   80,   70,   60,   50,   40,   30,   20,   10,    0]),
+                ( 101, [ 120,  100,   80,   60,   40,   20,    0]),
+                ( 900, [1000,  900,  800,  700,  600,  500,  400,  300,  200,  100,    0]),
+                ( 901, [1000,  900,  800,  700,  600,  500,  400,  300,  200,  100,    0]),
+                (1000, [1000,  900,  800,  700,  600,  500,  400,  300,  200,  100,    0]),
+                (1001, [1200, 1000,  800,  600,  400,  200,    0]),
+            ]),
+
+        ]
+
+        failures = []
+        for max_labels, cases in cases_by_max_labels:
+            for max_value, expected in cases:
+                actual = list(get_y_labels(max_value, max_labels=max_labels))
+                if actual != expected:
+                    failures.append(
+                        "max_labels=%s, max_value=%s: expected %s, got %s" %
+                        (max_labels, max_value, expected, actual))
+
+        if failures:
+            self.fail("%d y-label case(s) failed:\n%s" % (len(failures), "\n".join(failures)))
+
+    @override_settings(TIME_ZONE="America/New_York")
+    def test_sparkline_range_rounds_up_to_current_local_bucket_end(self):
+        now = datetime.datetime(2026, 1, 1, 17, 30, tzinfo=datetime.timezone.utc)
+
+        start, end, interval = get_sparkline_range(now, hour_step=6, days=1)
+
+        self.assertEqual(datetime.datetime(2025, 12, 31, 23, 0, tzinfo=datetime.timezone.utc), start)
+        self.assertEqual(datetime.datetime(2026, 1, 1, 23, 0, tzinfo=datetime.timezone.utc), end)
+        self.assertEqual(datetime.timedelta(hours=6), interval)
+
+    @override_settings(TIME_ZONE="Europe/Amsterdam")
+    def test_issue_event_sparkline_uses_local_day_edges_across_dst(self):
+        project = Project.objects.create(name="sparkline")
+        issue, _ = get_or_create_issue(project=project)
+        now = datetime.datetime(2026, 3, 29, 12, 0, tzinfo=datetime.timezone.utc)
+
+        sparkline = get_issue_event_sparkline(issue.id, now)
+
+        last_day_bucket = sparkline["variants"][0]["event_buckets"][-1]
+        self.assertEqual(datetime.datetime(2026, 3, 28, 23, 0, tzinfo=datetime.timezone.utc),
+                         last_day_bucket["bucket_start"])
+        self.assertEqual(datetime.datetime(2026, 3, 29, 22, 0, tzinfo=datetime.timezone.utc),
+                         last_day_bucket["bucket_end"])
+        self.assertEqual("29 Mar", last_day_bucket["label"])
+
+    def test_issue_list_sparkline_includes_current_open_hour(self):
+        project = Project.objects.create(name="sparkline")
+        issue, _ = get_or_create_issue(project=project)
+        now = datetime.datetime(2026, 5, 18, 13, 30, tzinfo=datetime.timezone.utc)
+        current_hour = hour_bucket(now)
+
+        IssueEventCountsPerHour.objects.create(
+            project=project, issue=issue, bucket=current_hour - datetime.timedelta(hours=24), count=100)
+        IssueEventCountsPerHour.objects.create(
+            project=project, issue=issue, bucket=current_hour - datetime.timedelta(hours=23), count=2)
+        IssueEventCountsPerHour.objects.create(project=project, issue=issue, bucket=current_hour, count=3)
+        IssueEventCountsPerHour.objects.create(
+            project=project, issue=issue, bucket=current_hour + datetime.timedelta(hours=1), count=100)
+
+        sparkline = get_issue_list_event_sparklines([issue.id], now)[issue.id]
+
+        self.assertEqual(24, len(sparkline["event_buckets"]))
+        self.assertEqual(5, sparkline["total"])
+        self.assertEqual(2, sparkline["event_buckets"][0]["count"])
+        self.assertEqual(3, sparkline["event_buckets"][-1]["count"])
+        self.assertEqual(20, sparkline["event_buckets"][0]["pct"])
+        self.assertEqual(30, sparkline["event_buckets"][-1]["pct"])
+        self.assertEqual(
+            "5 events in the past 24h",
+            sparkline["event_buckets"][-1]["title"],
+        )
+
+    def test_issue_event_sparkline_uses_hourly_buckets(self):
+        project = Project.objects.create(name="sparkline")
+        issue, _ = get_or_create_issue(project=project)
+        other_issue, _ = get_or_create_issue(
+            project=project,
+            event_data={"exception": {"values": [{"type": "Other", "value": "Other"}]}},
+        )
+        now = datetime.datetime(2026, 6, 14, 12, 34, tzinfo=datetime.timezone.utc)
+        start, _, _ = get_sparkline_range(now)
+
+        IssueEventCountsPerHour.objects.create(project=project, issue=issue, bucket=start, count=2, digest_order=7)
+        IssueEventCountsPerHour.objects.create(
+            project=project,
+            issue=issue,
+            bucket=start + datetime.timedelta(hours=1),
+            count=3,
+            digest_order=8,
+        )
+        IssueEventCountsPerHour.objects.create(
+            project=project,
+            issue=other_issue,
+            bucket=start,
+            count=99,
+            digest_order=99,
+        )
+
+        sparkline = get_issue_event_sparkline(issue.id, now)
+
+        self.assertEqual(5, sparkline["buckets"][0])
+        self.assertEqual(50, sparkline["bar_data"][0])
+        self.assertEqual(start, sparkline["event_buckets"][0]["bucket_start"])
+        self.assertEqual(start + datetime.timedelta(hours=6), sparkline["event_buckets"][0]["bucket_end"])
+        self.assertEqual("17 May 18:00 - 18 May 00:00", sparkline["event_buckets"][0]["label"])
+        self.assertEqual(5, sparkline["event_buckets"][0]["count"])
+        self.assertEqual(8, sparkline["event_buckets"][0]["digest_order"])
+        self.assertEqual(50, sparkline["event_buckets"][0]["pct"])
+        self.assertEqual(0, sparkline["event_buckets"][1]["count"])
+        self.assertEqual(0, sparkline["event_buckets"][1]["pct"])
+        self.assertEqual([24, 12, 6], [variant["interval_hours"] for variant in sparkline["variants"]])
+        self.assertEqual("18 May", sparkline["variants"][0]["event_buckets"][0]["label"])
+        self.assertFalse(any(bucket["contains_active_event"] for bucket in sparkline["event_buckets"]))
+
+        sparkline = get_issue_event_sparkline(issue.id, now, start + datetime.timedelta(hours=1))
+
+        self.assertFalse(any(bucket["contains_active_event"] for bucket in sparkline["variants"][0]["event_buckets"]))
+        self.assertTrue(sparkline["event_buckets"][0]["contains_active_event"])
+
+    def test_issue_event_sparkline_search_overlay_uses_matching_retained_events(self):
+        project = Project.objects.create(name="sparkline")
+        issue, _ = get_or_create_issue(project=project)
+        now = datetime.datetime(2026, 6, 14, 12, 34, tzinfo=datetime.timezone.utc)
+        start, _, _ = get_sparkline_range(now)
+
+        first_event = create_event(project, issue, timestamp=start + datetime.timedelta(hours=1))
+        second_event = create_event(project, issue, timestamp=start + datetime.timedelta(hours=2))
+        third_event = create_event(project, issue, timestamp=start + datetime.timedelta(hours=7))
+        for event in (first_event, second_event, third_event):
+            record_event_counts(project, issue, event.digested_at, event.digest_order)
+
+        store_tags(second_event, issue, {"foo": "bar"})
+        store_tags(third_event, issue, {"foo": "bar"})
+
+        sparkline = get_issue_event_sparkline(
+            issue.id,
+            now,
+            matching_event_qs=search_events(project, issue, "foo:bar"),
+        )
+
+        first_bucket = sparkline["event_buckets"][0]
+        second_bucket = sparkline["event_buckets"][1]
+        self.assertEqual(2, first_bucket["count"])
+        self.assertEqual(1, first_bucket["matching_count"])
+        self.assertEqual(2, first_bucket["digest_order"])
+        self.assertEqual(1, first_bucket["click_count"])
+        self.assertEqual(10, first_bucket["matching_pct"])
+        self.assertEqual("17 May 18:00 - 18 May 00:00: 1 matching event, 2 events total", first_bucket["title"])
+
+        self.assertEqual(1, second_bucket["count"])
+        self.assertEqual(1, second_bucket["matching_count"])
+        self.assertEqual(3, second_bucket["digest_order"])
 
 
 class RetentionUtilsTestCase(RegularTestCase):

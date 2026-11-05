@@ -4,6 +4,10 @@ from projects.models import Project
 from .service_backends.slack import SlackBackend
 from .service_backends.mattermost import MattermostBackend
 from .service_backends.discord import DiscordBackend
+from .service_backends.telegram import TelegramBackend
+from .service_backends.google_chat import GoogleChatBackend
+from .service_backends.custom import CustomBackend
+from .service_backends.msteams import MsTeamsBackend
 from .service_backends.jira_cloud import JiraCloudBackend
 from .service_backends.github_issues import GitHubIssuesBackend
 from .service_backends.microsoft_teams import MicrosoftTeamsBackend
@@ -15,13 +19,17 @@ def get_alert_service_kind_choices():
     # As a callable to avoid non-DB-affecting migrations for adding new kinds.
     # Messaging backends don't need translations since they are brand names.
     return [
+        ("custom", "Custom"),
         ("discord", "Discord"),
         ("github_issues", "GitHub Issues"),
+        ("google_chat", "Google Chat"),
         ("jira_cloud", "Jira Cloud"),
         ("mattermost", "Mattermost"),
-        ("microsoft_teams", "Microsoft Teams"),
+        ("microsoft_teams", "Microsoft Teams (Enhanced)"),
+        ("msteams", "Microsoft Teams"),
         ("pagerduty", "PagerDuty"),
         ("slack", "Slack"),
+        ("telegram", "Telegram"),
         ("webhook", "Webhook (Generic)"),
     ]
 
@@ -29,18 +37,26 @@ def get_alert_service_kind_choices():
 def get_alert_service_backend_class(kind):
     if kind == "discord":
         return DiscordBackend
-    if kind == "github_issues":
-        return GitHubIssuesBackend
-    if kind == "jira_cloud":
-        return JiraCloudBackend
+    if kind == "google_chat":
+        return GoogleChatBackend
     if kind == "mattermost":
         return MattermostBackend
+    if kind == "msteams":
+        return MsTeamsBackend
+    if kind == "slack":
+        return SlackBackend
+    if kind == "telegram":
+        return TelegramBackend
+    if kind == "custom":
+        return CustomBackend
+    if kind == "jira_cloud":
+        return JiraCloudBackend
+    if kind == "github_issues":
+        return GitHubIssuesBackend
     if kind == "microsoft_teams":
         return MicrosoftTeamsBackend
     if kind == "pagerduty":
         return PagerDutyBackend
-    if kind == "slack":
-        return SlackBackend
     if kind == "webhook":
         return WebhookBackend
     raise ValueError(f"Unknown backend kind: {kind}")

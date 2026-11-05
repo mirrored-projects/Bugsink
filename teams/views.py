@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from django.db import models
-from django.shortcuts import render, redirect
+from django.shortcuts import get_object_or_404, render, redirect
 from django.contrib.auth import get_user_model
 from django.http import Http404, HttpResponseRedirect
 from django.core.exceptions import PermissionDenied
@@ -14,31 +14,46 @@ from django.utils.translation import gettext_lazy as _
 from users.models import EmailVerification
 from bugsink.app_settings import get_settings, CB_ANYBODY, CB_ADMINS, CB_MEMBERS
 from bugsink.decorators import login_exempt, atomic_for_request_method
+from bugsink.invite_links import email_not_sent_invite_link_notice, manual_invite_link_notice
+from bugsink.utils import email_backend_delivers_mail
 
-from .models import Team, TeamMembership, TeamRole, TeamVisibility
+from .models import (
+    Team,
+    TeamMembership,
+    TeamRole,
+    teams_visible_to_user,
+    user_can_create_team,
+    user_is_team_admin,
+)
 from .forms import TeamMemberInviteForm, TeamMembershipForm, MyTeamMembershipForm, TeamForm
 from .tasks import send_team_invite_email, send_team_invite_email_new_user
 
 User = get_user_model()
 
 
+def _leave_team(request, membership, team_pk):
+    # a team without admins can't be managed anymore, so the last admin has to promote someone else first
+    other_admins = TeamMembership.objects.filter(
+        team=team_pk, role=TeamRole.ADMIN, accepted=True).exclude(id=membership.id)
+    if membership.accepted and membership.is_admin() and not other_admins.exists():
+        messages.warning(
+            request, _("You are the last admin of this team. Promote another member or delete the team first."))
+    else:
+        membership.delete()
+        messages.success(request, _('You have left the team "%s"') % membership.team.name)
+
+
 @atomic_for_request_method
 def team_list(request, ownership_filter=None):
     my_memberships = TeamMembership.objects.filter(user=request.user)
+    visible_teams = teams_visible_to_user(Team.objects.all(), request.user)
 
     # using `id__in` here to ensure the member_count later on is not restricted to our own memberships (at most 1)
-    my_teams = Team.objects.filter(id__in=TeamMembership.objects.filter(user=request.user).values('team_id'))
+    my_teams = visible_teams.filter(id__in=TeamMembership.objects.filter(user=request.user).values('team_id'))
 
-    if request.user.is_superuser:
-        # superusers can see all teams, even hidden ones
-        other_teams = Team.objects\
-            .exclude(teammembership__in=my_memberships)\
-            .order_by('name').distinct()
-    else:
-        other_teams = Team.objects\
-            .exclude(teammembership__in=my_memberships)\
-            .exclude(visibility=TeamVisibility.HIDDEN)\
-            .order_by('name').distinct()
+    other_teams = visible_teams \
+        .exclude(teammembership__in=my_memberships) \
+        .order_by('name').distinct()
 
     if ownership_filter is None:
         # if no tab is provided, we redirect to the most informative one. generally we prefer "mine", but not when empty
@@ -51,7 +66,9 @@ def team_list(request, ownership_filter=None):
         full_action_str = request.POST.get('action')
         action, team_pk = full_action_str.split(":", 1)
         if action == "leave":
-            TeamMembership.objects.filter(team=team_pk, user=request.user.id).delete()
+            membership = get_object_or_404(TeamMembership, team=team_pk, user=request.user, accepted=True)
+            _leave_team(request, membership, team_pk)
+            return redirect('team_list_mine')
         elif action == "join":
             team = Team.objects.get(id=team_pk)
             if not team.is_joinable() and not request.user.is_superuser:
@@ -85,9 +102,7 @@ def team_list(request, ownership_filter=None):
         team_list = team_list_2
 
     return render(request, 'teams/team_list.html', {
-        'can_create':
-            get_settings().TEAM_CREATION in [CB_ANYBODY, CB_MEMBERS] or
-            (request.user.is_superuser and get_settings().TEAM_CREATION == CB_ADMINS),
+        'can_create': user_can_create_team(request.user),
         'ownership_filter': ownership_filter,
         'team_list': team_list,
     })
@@ -95,8 +110,7 @@ def team_list(request, ownership_filter=None):
 
 @atomic_for_request_method
 def team_new(request):
-    if not (get_settings().TEAM_CREATION in [CB_ANYBODY, CB_MEMBERS] or
-            (request.user.is_superuser and get_settings().TEAM_CREATION == CB_ADMINS)):
+    if not user_can_create_team(request.user):
         raise PermissionDenied("You are not allowed to create teams")
 
     if request.method == 'POST':
@@ -120,8 +134,7 @@ def team_new(request):
 @atomic_for_request_method
 def team_edit(request, team_pk):
     team = Team.objects.get(id=team_pk)
-    if (not TeamMembership.objects.filter(team=team, user=request.user, role=TeamRole.ADMIN, accepted=True).exists() and
-            not request.user.is_superuser):
+    if not user_is_team_admin(request.user, team):
         raise PermissionDenied("You are not an admin of this team")
 
     if request.method == 'POST':
@@ -129,9 +142,7 @@ def team_edit(request, team_pk):
 
         if action == 'delete':
             # Double-check that the user is an admin or superuser
-            if not (TeamMembership.objects.filter(
-                        team=team, user=request.user, role=TeamRole.ADMIN, accepted=True).exists() or
-                    request.user.is_superuser):
+            if not user_is_team_admin(request.user, team):
                 raise PermissionDenied("Only team admins can delete teams")
 
             # Delete all associated projects first
@@ -158,23 +169,41 @@ def team_edit(request, team_pk):
 @atomic_for_request_method
 def team_members(request, team_pk):
     team = Team.objects.get(id=team_pk)
-    if (not TeamMembership.objects.filter(team=team, user=request.user, role=TeamRole.ADMIN, accepted=True).exists() and
-            not request.user.is_superuser):
+    if not user_is_team_admin(request.user, team):
         raise PermissionDenied("You are not an admin of this team")
+    invite_link_notice = None
 
     if request.method == 'POST':
         full_action_str = request.POST.get('action')
         action, user_id = full_action_str.split(":", 1)
         if action == "remove":
+            if str(user_id) == str(request.user.id):
+                membership = get_object_or_404(TeamMembership, team=team_pk, user=request.user)
+                _leave_team(request, membership, team_pk)
+                return redirect('team_list_mine')
             TeamMembership.objects.filter(team=team_pk, user=user_id).delete()
-        elif action == "reinvite":
+        elif action == "copy_invite_link" and not email_backend_delivers_mail():
+            membership = get_object_or_404(
+                TeamMembership.objects.select_related("user"), team=team, user_id=user_id, accepted=False)
+            invite_link = _create_team_invite_link(membership.user, team_pk, create_account_setup_link=False)
+            if invite_link is None:
+                raise PermissionDenied("Cannot show an account setup link for an existing inactive user")
+            invite_link_notice = manual_invite_link_notice(invite_link, membership.user.email)
+        elif action == "reinvite" and email_backend_delivers_mail():
             user = User.objects.get(id=user_id)
             _send_team_invite_email(user, team_pk)
             messages.success(request, f"Invitation resent to {user.email}")
 
+    return _render_team_members(request, team, invite_link_notice)
+
+
+def _render_team_members(request, team, invite_link_notice=None):
     return render(request, 'teams/team_members.html', {
         'team': team,
         'members': team.teammembership_set.all().select_related('user'),
+        'can_send_invites': email_backend_delivers_mail(),
+        'can_copy_invite_links': not email_backend_delivers_mail(),
+        'invite_link_notice': invite_link_notice,
     })
 
 
@@ -189,11 +218,24 @@ def _send_team_invite_email(user, team_pk):
         send_team_invite_email_new_user.delay(user.email, team_pk, verification.token)
 
 
+def _create_team_invite_link(user, team_pk, create_account_setup_link):
+    if user.is_active:
+        return get_settings().BASE_URL + reverse("team_members_accept", kwargs={"team_pk": team_pk})
+
+    if not create_account_setup_link:
+        return None
+
+    verification = EmailVerification.objects.create(user=user, email=user.username)
+    return get_settings().BASE_URL + reverse("team_members_accept_new_user", kwargs={
+        "team_pk": team_pk,
+        "token": verification.token,
+    })
+
+
 @atomic_for_request_method
 def team_members_invite(request, team_pk):
     team = Team.objects.get(id=team_pk)
-    if (not TeamMembership.objects.filter(team=team, user=request.user, role=TeamRole.ADMIN, accepted=True).exists() and
-            not request.user.is_superuser):
+    if not user_is_team_admin(request.user, team):
         raise PermissionDenied("You are not an admin of this team")
 
     if get_settings().USER_REGISTRATION in [CB_ANYBODY, CB_MEMBERS]:
@@ -214,18 +256,41 @@ def team_members_invite(request, team_pk):
             user, user_created = User.objects.get_or_create(
                 email=email, defaults={'username': email, 'is_active': False})
 
-            _send_team_invite_email(user, team_pk)
+            if email_backend_delivers_mail():
+                _send_team_invite_email(user, team_pk)
+                invite_link = None
+            else:
+                invite_link = _create_team_invite_link(user, team_pk, create_account_setup_link=user_created)
 
             _, membership_created = TeamMembership.objects.get_or_create(team=team, user=user, defaults={
                 'role': form.cleaned_data['role'],
                 'accepted': False,
             })
 
+            if invite_link is not None:
+                invite_link_notice = email_not_sent_invite_link_notice(invite_link, user.email)
+                form = TeamMemberInviteForm(user_must_exist)
+                if request.POST.get('action') == "invite_and_add_another":
+                    return render(request, 'teams/team_members_invite.html', {
+                        'team': team,
+                        'form': form,
+                        'invite_link_notice': invite_link_notice,
+                    })
+                return _render_team_members(request, team, invite_link_notice)
+
             if membership_created:
-                messages.success(request, f"Invitation sent to {email}")
+                if email_backend_delivers_mail():
+                    messages.success(request, f"Invitation sent to {email}")
+                else:
+                    messages.success(
+                        request, f"Invitation created for {email}, but no email was sent because email is not set up.")
             else:
-                messages.success(
-                    request, f"Invitation resent to {email} (it was previously sent and we just sent it again)")
+                if email_backend_delivers_mail():
+                    messages.success(
+                        request, f"Invitation resent to {email} (it was previously sent and we just sent it again)")
+                else:
+                    messages.success(request, (
+                        f"Invitation already exists for {email}, but no email was sent because email is not set up."))
 
             if request.POST.get('action') == "invite_and_add_another":
                 return redirect('team_members_invite', team_pk=team_pk)
@@ -294,7 +359,8 @@ def team_members_accept_new_user(request, team_pk, token):
     # clean up expired tokens; doing this on every request is just fine, it saves us from having to run a cron
     # job-like thing
     EmailVerification.objects.filter(
-        created_at__lt=timezone.now() - timedelta(get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
+        created_at__lt=timezone.now() - timedelta(
+            seconds=get_settings().USER_REGISTRATION_VERIFY_EMAIL_EXPIRY)).delete()
 
     try:
         verification = EmailVerification.objects.get(token=token)

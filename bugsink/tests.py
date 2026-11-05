@@ -1,7 +1,8 @@
 import io
 import pprint
 import re
-import brotli
+import zlib
+import brotli_rs as brotli
 
 from unittest import TestCase as RegularTestCase
 from unittest.mock import patch
@@ -18,12 +19,27 @@ from .wsgi import allowed_hosts_error_message
 from .test_utils import TransactionTestCase25251 as TransactionTestCase
 from .transaction import immediate_atomic
 from .volume_based_condition import VolumeBasedCondition
-from .utils import send_rendered_email
+from .utils import email_backend_delivers_mail, send_rendered_email
 from .streams import (
     compress_with_zlib, GeneratorReader, WBITS_PARAM_FOR_GZIP, WBITS_PARAM_FOR_DEFLATE, MaxDataReader,
     MaxDataWriter, zlib_generator, brotli_generator, BrotliError)
 
 User = get_user_model()
+
+
+class CompressionDependencyTestCase(RegularTestCase):
+    def test_brotli_bindings_are_not_installed(self):
+        """Keep automatic Brotli support out of dependencies that discover it.
+
+        This test prevents accidental inclusion of Brotli bindings in the dependency tree.
+        See https://www.bugsink.com/blog/bye-bye-brotli/. requests, urllib3, sentry-sdk (and possibly future deps) would
+        pick up Brotli support automatically if it were installed, which we don't want.
+        """
+        with self.assertRaises(ImportError):
+            import brotli  # noqa: F401
+
+        with self.assertRaises(ImportError):
+            import brotlicffi  # noqa: F401
 
 
 def apply_n(f, n, v):
@@ -40,6 +56,16 @@ class VolumeBasedConditionTestCase(RegularTestCase):
 
         vbc2 = VolumeBasedCondition.from_dict(vbc.to_dict())
         self.assertEqual(vbc, vbc2)
+
+
+class EmailBackendDeliversMailTestCase(SimpleTestCase):
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
+    def test_importable_delivering_backend_delivers_mail(self):
+        self.assertTrue(email_backend_delivers_mail())
+
+    @override_settings(EMAIL_BACKEND="django.core.mail.backends.dummy.EmailBackend")
+    def test_known_non_delivering_backend_does_not_deliver_mail(self):
+        self.assertFalse(email_backend_delivers_mail())
 
 
 @override_settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend")
@@ -62,7 +88,9 @@ class SendRenderedEmailTestCase(SimpleTestCase):
 
     @override_settings(DEFAULT_FROM_EMAIL="Bugsink <alerts@bugsink.com>", ALLOWED_HOSTS=["tenant.bugsink.com"])
     @patch("phonehome.models.Installation.check_and_inc_email_quota", return_value=True)
-    def test_send_rendered_email_allows_bugsink_sender_domain_when_hosted_on_bugsink_domain(self, _quota_ok):
+    @patch("phonehome.models.Installation.record_email_attempt")
+    def test_send_rendered_email_allows_bugsink_sender_domain_when_hosted_on_bugsink_domain(
+            self, record_attempt, _quota_ok):
         send_rendered_email(
             "Subject",
             "mails/welcome_email",
@@ -71,6 +99,7 @@ class SendRenderedEmailTestCase(SimpleTestCase):
         )
 
         self.assertEqual(1, len(mail.outbox))
+        record_attempt.assert_called_once()
 
 
 class StreamsTestCase(RegularTestCase):
@@ -94,6 +123,40 @@ class StreamsTestCase(RegularTestCase):
         reader = GeneratorReader(zlib_generator(compressed_stream, WBITS_PARAM_FOR_DEFLATE))
 
         self.assertEqual(myself_times_ten, reader.read())
+
+    def test_decompress_deflate_with_one_byte_chunks(self):
+        # An empty zlib result is not EOF, and output buffered until later must still be returned.
+        data = b"\x00" * 31
+        compressed = compress_with_zlib(io.BytesIO(data), WBITS_PARAM_FOR_DEFLATE)
+        reader = GeneratorReader(zlib_generator(io.BytesIO(compressed), WBITS_PARAM_FOR_DEFLATE, chunk_size=1))
+
+        self.assertEqual(data[:1], reader.read(1))
+        self.assertEqual(data[1:], reader.read())
+
+    def test_decompress_zlib_limits_output_allocation(self):
+        # Implementation-level comparison of zlib_generator before and after it started passing max_length.
+        plain_size = 10_000_000
+        chunk_size = 1_000
+
+        for wbits in [WBITS_PARAM_FOR_GZIP, WBITS_PARAM_FOR_DEFLATE]:
+            compressed = compress_with_zlib(io.BytesIO(b"\x00" * plain_size), wbits)
+
+            # Before: zlib_generator called decompress() without max_length. We do not do this anymore.
+            output_without_max_length = zlib.decompressobj(wbits=wbits).decompress(compressed[:chunk_size])
+            # Failure: a 1 kB compressed chunk allocates >1 MB before MaxDataReader can enforce its limit.
+            self.assertGreater(len(output_without_max_length), 1_000_000)
+
+            # After: zlib_generator passes max_length and bounds the returned bytes object.
+            output_with_max_length = next(zlib_generator(io.BytesIO(compressed), wbits, chunk_size=chunk_size))
+            self.assertLessEqual(len(output_with_max_length), chunk_size)
+
+    def test_decompress_zlib_requires_complete_stream(self):
+        # Proves truncated compressed bodies are not accepted as complete decoded bodies.
+        for wbits in [WBITS_PARAM_FOR_GZIP, WBITS_PARAM_FOR_DEFLATE]:
+            compressed = compress_with_zlib(io.BytesIO(b"hello" * 100), wbits)
+
+            with self.assertRaises(zlib.error):
+                list(zlib_generator(io.BytesIO(compressed[:-1]), wbits))
 
     def test_compress_decompress_brotli(self):
         with open(__file__, 'rb') as f:
