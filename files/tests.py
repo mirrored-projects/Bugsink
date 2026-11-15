@@ -2,7 +2,7 @@ from hashlib import sha1
 from datetime import timedelta
 from uuid import UUID, uuid4
 import json
-import gzip
+import gzip  # intentionally uses C-zlib to test compatibility with the Rust codec
 import io
 from io import BytesIO
 import os
@@ -12,7 +12,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from zipfile import ZipFile, ZIP_BZIP2, ZIP_DEFLATED
+from zipfile import (  # intentionally uses C-zlib to test compatibility with the Rust codec
+    ZipFile, ZIP_BZIP2, ZIP_DEFLATED,
+)
 
 from django.test import tag
 from django.test.utils import CaptureQueriesContext
@@ -34,7 +36,7 @@ from bugsink.moreiterutils import batched
 from bugsink.app_settings import override_settings as bugsink_override_settings
 from bugsink.streams import MaxLengthExceeded
 
-from .models import Chunk, File, FileMetadata, get_file_metadata_for_debug_ids
+from .models import Chunk, File, FileMetadata, get_file_metadata_for_debug_ids, _binary_to_bytes
 from .minidump import event_threads_for_process_state
 from .storage_registry import override_object_storages
 from .tasks import assemble_file, create_chunk, create_file_from_local_file, process_artifact_bundle, vacuum_files_sync
@@ -389,6 +391,21 @@ class FilesTests(TransactionTestCase):
 
         self.assertEqual(413, response.status_code)
         self.assertIn("chunk upload size", response.json()["error"])
+
+    def test_chunk_upload_with_concatenated_gzip_members(self):
+        data = b"hello world"
+        checksum = sha1(data, usedforsecurity=False).hexdigest()
+        upload = BytesIO(gzip.compress(data[:5]) + gzip.compress(data[5:]))
+        upload.name = checksum
+
+        response = self.client.post(
+            "/api/0/organizations/anyorg/chunk-upload/",
+            data={"file_gzip": upload},
+            headers=self.token_headers,
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(data, _binary_to_bytes(Chunk.objects.get(checksum=checksum).data))
 
     def test_assemble_file_to_object_storage(self):
         data = b"hello world"
@@ -752,6 +769,7 @@ class FilesTests(TransactionTestCase):
         for create_with in uuids:
             FileMetadata.objects.all().delete()  # clean up before each test
             FileMetadata.objects.create(
+                project=self.project,
                 debug_id=create_with,
                 file_type="source_map",
                 file=file,
@@ -761,11 +779,12 @@ class FilesTests(TransactionTestCase):
                 fms = FileMetadata.objects.filter(debug_id__in=[test_with])
                 self.assertEqual(1, fms.count())
 
-    def test_get_file_metadata_for_debug_ids_uses_project_scope_before_legacy_fallback(self):
+    def test_get_file_metadata_for_debug_ids_only_uses_the_requested_project(self):
         scoped_debug_id = uuid4()
-        legacy_debug_id = uuid4()
+        other_debug_id = uuid4()
+        other_project = Project.objects.create(name="other")
         file = File.objects.create(checksum="a" * 40, filename="scoped.js.map", size=0)
-        legacy_file = File.objects.create(checksum="b" * 40, filename="legacy.js.map", size=0)
+        other_file = File.objects.create(checksum="b" * 40, filename="other.js.map", size=0)
 
         scoped_metadata = FileMetadata.objects.create(
             project=self.project,
@@ -773,17 +792,17 @@ class FilesTests(TransactionTestCase):
             file_type="source_map",
             file=file,
         )
-        FileMetadata.objects.create(debug_id=scoped_debug_id, file_type="source_map", file=legacy_file)
-        legacy_metadata = FileMetadata.objects.create(debug_id=legacy_debug_id, file_type="source_map", file=file)
+        for debug_id in (scoped_debug_id, other_debug_id):
+            FileMetadata.objects.create(
+                project=other_project, debug_id=debug_id, file_type="source_map", file=other_file)
 
         result = get_file_metadata_for_debug_ids(
             self.project,
-            [scoped_debug_id, legacy_debug_id],
+            [scoped_debug_id, other_debug_id],
             "source_map",
         )
 
-        self.assertEqual(scoped_metadata, result[scoped_debug_id])
-        self.assertEqual(legacy_metadata, result[legacy_debug_id])
+        self.assertEqual({scoped_debug_id: scoped_metadata}, result)
 
     @patch("files.tasks.extract_dif_kind")
     def test_difs_assemble_stores_project_scoped_metadata(self, mock_extract_dif_kind):
